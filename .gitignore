@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dataset payload and generated benchmark outputs. Populated from the public
+# Hugging Face bundle by scripts/00_download_dataset.py.
+data/

@@ -12,7 +12,7 @@ Key differences from reference:
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 pixi run -e cytoself train-cytoself \\
-        --manifest-csv data/interim/cytoself/manifests/manifest_b13_b16.csv \\
+        --manifest-csv data/interim/cytoself/manifests/manifest_all_public_batches.csv \\
         --output-dir data/interim/cytoself/models/gfp_nucdist_s43 \\
         --max-epoch 20 --seed 43
 

@@ -1,15 +1,20 @@
 # MisLocus — companion repo
 
-Reproduce the protein-localization representation benchmark from the published
-**MisLocus single-cell crop dataset**. This repo ships the code needed
-*downstream* of feature preprocessing — `features.parquet` files come
-pre-computed in the dataset bundle, ready for classification and benchmarking.
+Reproduce the protein-localization representation benchmark from the
+**MisLocus single-cell crop dataset**, which is derived from the public VarChAMP
+image collection (`cpg0020-varchamp`). MisLocus contributes the QC-filtered crop
+cohort, harmonized annotations and representations, replicate-aware evaluation,
+and benchmark code; it does not introduce the underlying image acquisition.
+
+This repo ships the code needed *downstream* of feature preprocessing —
+`features.parquet` files come pre-computed in the Hugging Face dataset bundle,
+ready for classification and benchmarking.
 
 ## What you get
 
 The dataset bundle (download separately, see below) ships into `data/`:
 
-- **Per-rep features** — `data/interim/{cellprofiler,cytoself,subcell_portable_*,vit}/{batch}/features.parquet`.
+- **Per-rep features** — `data/interim/{cellprofiler,cytoself,subcell_finetuned_mae,subcell_finetuned_vit,subcell_portable_rbg_mae,subcell_portable_rbg_vit}/{batch}/features.parquet`.
 - **Crop manifest** — `data/interim/crop_manifest/{batch}/manifest.parquet` (one row per cell).
 - **QC'd single-cell crops** (optional) — `data/interim/single_cell_crops/{batch}/{allele}/*.npy` (128×128 uint16, 4 channels: DNA / GFP / AGP / Mito).
 
@@ -29,7 +34,7 @@ The five recipes you'll actually use (run `just --list` for the full set):
 # 0. Install pixi: https://pixi.sh/install
 just install
 
-# 1. Browseable sample (~1.2 GB, no GPU needed) — 8 alleles × 2 batches
+# 1. Browseable sample (~1.24 GB, no GPU needed) — 8 alleles × 2 batches
 #    of single-cell crops, plus a sample manifest.
 just download-sample
 just inspect-sample
@@ -88,8 +93,10 @@ data/processed/benchmark/clinvar/full_dataset/summary_across_reps/
 | `gpu`     | XGBoost classification (`09 --gpu`). Inherits `default` + adds the CUDA-12 system requirement so conda-forge resolves to GPU-enabled xgboost. |
 
 The `cytoself` / `subcell` / `vit` envs only matter if you re-extract or
-retrain a representation from raw crops; they're not needed for the
-classification + benchmark workflow.
+retrain a representation from crops; they're not needed for the classification
+and benchmark workflow over the six feature sets bundled on Hugging Face.
+MorphEM (`vit`) features are not precomputed in the bundle; reproduce them from
+the released crops with `scripts/08b_extract_vit_embeddings.py`.
 
 ## Adding a new representation
 

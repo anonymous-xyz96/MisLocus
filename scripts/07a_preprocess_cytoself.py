@@ -27,7 +27,9 @@ DATA_DIR = REPO_ROOT / "data"
 CROPS_DIR = DATA_DIR / "interim" / "single_cell_crops"
 MANIFEST_OUT_DIR = DATA_DIR / "interim" / "cytoself" / "manifests"
 
-FOCUS_BATCHES = [
+PUBLIC_BATCHES = [
+    "2024_01_23_Batch_7",
+    "2024_02_06_Batch_8",
     "2025_01_27_Batch_13",
     "2025_01_28_Batch_14",
     "2025_03_17_Batch_15",
@@ -110,13 +112,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-csv",
         type=Path,
-        default=MANIFEST_OUT_DIR / "manifest_b13_b16.csv",
+        default=MANIFEST_OUT_DIR / "manifest_all_public_batches.csv",
     )
     p.add_argument("--crops-dir", type=Path, default=CROPS_DIR)
     p.add_argument(
         "--batches",
         type=str,
-        default=",".join(FOCUS_BATCHES),
+        default=",".join(PUBLIC_BATCHES),
         help="Comma-separated batch IDs",
     )
     return p.parse_args()

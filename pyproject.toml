@@ -1,7 +1,7 @@
 [project]
 name = "prot-loc-benchmark"
 version = "0.1.0"
-description = "Minimal companion repo: reproduce the protein-localization benchmark from the published cell-crop dataset"
+description = "Companion repo for reproducing the MisLocus protein-localization benchmark from the released cell-crop dataset"
 requires-python = ">= 3.12"
 dependencies = []
 

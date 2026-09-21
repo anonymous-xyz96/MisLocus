@@ -1,9 +1,14 @@
 # Dataset bundle
 
-The dataset bundle is everything you need to start at the
-preprocessing step (`scripts/06_preprocess_profiles.py`). It is published
-alongside the parent paper / preprint on Hugging Face Hub at
+The dataset bundle is derived from the public VarChAMP image collection
+(`cpg0020-varchamp`) and provides the QC-filtered MisLocus crop cohort plus
+precomputed benchmark features. It is published alongside the paper on Hugging
+Face Hub at
 [`anonymous-xyz96/MisLocus`](https://huggingface.co/datasets/anonymous-xyz96/MisLocus).
+For the bundled `features.parquet` files, start directly at classification
+(`scripts/09_classify.py` or `scripts/09c_classify_PA.py`); preprocessing with
+`scripts/06_preprocess_profiles.py` is only needed after extracting a new raw
+embedding.
 
 ## Downloading
 
@@ -24,7 +29,7 @@ pass `--force` to re-fetch.
 # the single-cell crop tarball shards (tens of GB per batch).
 pixi run python scripts/00_download_dataset.py
 # or
-just download
+just download-all
 ```
 
 To drop the heavy crop shards (features and manifests still come down,
@@ -34,14 +39,14 @@ plenty for `09 / 09c / 10 / 10b`):
 pixi run python scripts/00_download_dataset.py --no-include-crops
 ```
 
-### Dataset bundle — smoke-test subset (one rep × one batch)
+### Dataset bundle — smoke-test subset (one representation × one batch)
 
 For a quick sanity check or partial materialization, restrict by
 representation and/or batch. Crop shards are excluded by default in
 subset mode:
 
 ```bash
-# ~120 MB cytoself features for one batch — enough to run 09 / 09c / 11.
+# ~120 MB cytoself features for one batch — enough to run 09 / 09c.
 pixi run python scripts/00_download_dataset.py \
     --rep cytoself --batch 2025_01_27_Batch_13
 
@@ -54,13 +59,17 @@ pixi run python scripts/00_download_dataset.py \
     --batch 2025_01_27_Batch_13 --include-crops
 ```
 
-### Dataset bundle — override the HF repo
+### Dataset bundle — override or pin the HF source
 
 ```bash
 pixi run python scripts/00_download_dataset.py --hf-repo myorg/my-dataset
 # or via env var
 PROT_LOC_BENCHMARK_HF_REPO=myorg/my-dataset \
     pixi run python scripts/00_download_dataset.py
+
+# Pin the anonymous bundle to an immutable Hugging Face commit SHA.
+pixi run python scripts/00_download_dataset.py \
+    --revision cf70fbaedf64874907730f8b8db3a62d79149164
 ```
 
 ### SubCell pretrained weights
@@ -119,6 +128,11 @@ data/
 │   └── subcell_finetuned_mae/
 └── processed/                         # empty until 09 / 10 / 10b / 11 run
 ```
+
+Those six representation directories are the feature sets currently bundled on
+Hugging Face. MorphEM is evaluated in the paper but is not shipped as a
+precomputed `vit/` feature directory; use the released crops with
+`scripts/08b_extract_vit_embeddings.py` to reproduce it.
 
 In-repo (NOT downloaded — tracked in git, ~9.7 MB total):
 
@@ -246,9 +260,9 @@ pixi run python scripts/11_summarize_across_reps.py   # picks up <myrep> automat
 
 ## Reproducibility
 
-- The bundle is content-addressed via the HF dataset repo's revision SHA
-  (which `snapshot_download` records in its cache); pin
-  `--hf-repo anonymous-xyz96/MisLocus@<sha>` to lock it.
+- The bundle is content-addressed by its Hugging Face revision. Pass
+  `--revision <commit-sha>` to lock a download; the repo ID remains
+  `anonymous-xyz96/MisLocus`.
 - The classification + benchmark steps are deterministic given the same
   XGBoost parameters in `config.XGBOOST_PARAMS` (set `random_state` if you
   add it).

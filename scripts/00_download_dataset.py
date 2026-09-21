@@ -28,7 +28,7 @@ SubCell encoder weights are downloaded by a separate script
 Usage:
     pixi run python scripts/00_download_dataset.py                    # full mirror
 
-    # Just the small browseable sample subset (~1.2 GB, 8 alleles × 2
+    # Just the small browseable sample subset (~1.24 GB, 8 alleles × 2
     # batches of single-cell crops + a sample manifest). Doesn't touch
     # the rest of the bundle. Files land at data/sample/.
     pixi run python scripts/00_download_dataset.py --sample
@@ -41,9 +41,11 @@ Usage:
     # Multiple reps / batches (comma-separated or repeated flags).
     pixi run python scripts/00_download_dataset.py --rep cytoself,cellprofiler
 
-    # Override the HF repo (or set PROT_LOC_BENCHMARK_HF_REPO).
+    # Override the HF repo or pin its immutable revision.
     pixi run python scripts/00_download_dataset.py --hf-repo myorg/my-dataset
+    pixi run python scripts/00_download_dataset.py --revision <commit-sha>
 """
+
 from __future__ import annotations
 
 import argparse
@@ -59,7 +61,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from prot_loc_benchmark.config import (
+from prot_loc_benchmark.config import (  # noqa: E402
     BIOREP_PAIRS,
     DATA_DIR,
     INTERIM_DIR,
@@ -72,6 +74,7 @@ DEFAULT_HF_REPO = os.environ.get(
     "PROT_LOC_BENCHMARK_HF_REPO",
     "anonymous-xyz96/MisLocus",
 )
+DEFAULT_HF_REVISION = os.environ.get("PROT_LOC_BENCHMARK_HF_REVISION")
 
 # Build {short_batch_num: full_batch_id}, e.g. "13" -> "2025_01_27_Batch_13".
 # Used to remap HF's manifest_Batch_X.parquet to per-batch crop_manifest dirs.
@@ -164,9 +167,7 @@ def _remap_to_pipeline_layout() -> None:
             num = m.group(1)
             full = _BATCH_NUM_TO_FULL_ID.get(num)
             if full is None:
-                logger.warning(
-                    "  [manifest] no BIOREP_PAIRS entry for Batch_%s — leaving at %s", num, src
-                )
+                logger.warning("  [manifest] no BIOREP_PAIRS entry for Batch_%s — leaving at %s", num, src)
                 continue
             dst = INTERIM_DIR / "crop_manifest" / full / "manifest.parquet"
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -215,8 +216,87 @@ def _cleanup_hf_root_noise() -> None:
             logger.info("  [cleanup] removed HF artifact %s", p.relative_to(DATA_DIR))
 
 
-def download_sample(hf_repo: str, force: bool = False) -> None:
-    """Download the small browseable sample subset (~1.2 GB) into ``data/sample/``.
+def _validate_remote_payload(
+    hf_repo: str,
+    revision: str | None,
+    *,
+    reps: list[str] | None = None,
+    batches: list[str] | None = None,
+    sample: bool = False,
+) -> None:
+    """Validate requested paths against the selected HF revision, not local state."""
+    from huggingface_hub import HfApi
+
+    files = set(
+        HfApi().list_repo_files(
+            repo_id=hf_repo,
+            repo_type="dataset",
+            revision=revision,
+        )
+    )
+
+    missing: list[str] = []
+    if sample and not any(path.startswith("sample/") for path in files):
+        missing.append("sample/**")
+
+    if reps:
+        for rep in reps:
+            prefix = f"representations/{rep}/"
+            if batches:
+                for batch in batches:
+                    path = f"{prefix}{batch}/features.parquet"
+                    if path not in files:
+                        missing.append(path)
+            elif not any(path.startswith(prefix) and path.endswith("/features.parquet") for path in files):
+                missing.append(f"{prefix}*/features.parquet")
+    elif batches:
+        for batch in batches:
+            suffix = f"/{batch}/features.parquet"
+            if not any(path.startswith("representations/") and path.endswith(suffix) for path in files):
+                missing.append(f"representations/*{suffix}")
+
+    if missing:
+        formatted = "\n  - ".join(missing)
+        raise FileNotFoundError(
+            "The requested payload was not found in the selected Hugging Face "
+            f"repository/revision:\n  - {formatted}\n"
+            "Check the names and the dataset card's repository layout."
+        )
+
+
+def _validate_downloaded_features(
+    reps: list[str] | None,
+    batches: list[str] | None,
+) -> None:
+    """Confirm that requested feature files were materialized after remapping."""
+    missing: list[str] = []
+    if reps:
+        for rep in reps:
+            rep_dir = INTERIM_DIR / rep
+            if batches:
+                for batch in batches:
+                    path = rep_dir / batch / "features.parquet"
+                    if not path.is_file():
+                        missing.append(str(path.relative_to(DATA_DIR)))
+            elif not any(rep_dir.glob("*/features.parquet")):
+                missing.append(str((rep_dir / "*/features.parquet").relative_to(DATA_DIR)))
+    elif batches:
+        for batch in batches:
+            if not any(INTERIM_DIR.glob(f"*/{batch}/features.parquet")):
+                missing.append(f"interim/*/{batch}/features.parquet")
+
+    if missing:
+        formatted = "\n  - ".join(missing)
+        raise FileNotFoundError(f"The requested files were not materialized after download:\n  - {formatted}")
+
+
+def download_sample(
+    hf_repo: str,
+    *,
+    revision: str | None = None,
+    force: bool = False,
+) -> None:
+    """Download the small browseable sample subset (~1.24 GB) into ``data/sample/``.
 
     The HF repo ships a ``sample/`` directory with one tarball per
     (batch, allele) — a curated handful of alleles for two batches —
@@ -229,10 +309,17 @@ def download_sample(hf_repo: str, force: bool = False) -> None:
     """
     from huggingface_hub import snapshot_download
 
-    logger.info("Downloading sample subset from %s into %s ...", hf_repo, DATA_DIR)
+    _validate_remote_payload(hf_repo, revision, sample=True)
+    logger.info(
+        "Downloading sample subset from %s (revision=%s) into %s ...",
+        hf_repo,
+        revision or "main",
+        DATA_DIR,
+    )
     snapshot_download(
         repo_id=hf_repo,
         repo_type="dataset",
+        revision=revision,
         local_dir=str(DATA_DIR),
         force_download=force,
         allow_patterns=["sample/**", "*.md", "LICENSE", "*.json", ".gitattributes"],
@@ -240,9 +327,8 @@ def download_sample(hf_repo: str, force: bool = False) -> None:
 
     sample_dir = DATA_DIR / "sample"
     if not sample_dir.is_dir():
-        logger.warning("No sample/ directory after download — repo may not ship one.")
         _cleanup_hf_root_noise()
-        return
+        raise FileNotFoundError("The validated sample payload was not materialized under data/sample/.")
 
     archives = sorted(sample_dir.rglob("*.tar.gz"))
     logger.info("Extracting %d sample tarballs in place ...", len(archives))
@@ -259,6 +345,7 @@ def download_sample(hf_repo: str, force: bool = False) -> None:
 def download_dataset_bundle(
     hf_repo: str,
     *,
+    revision: str | None = None,
     reps: list[str] | None = None,
     batches: list[str] | None = None,
     include_crops: bool = True,
@@ -271,11 +358,14 @@ def download_dataset_bundle(
     from huggingface_hub import snapshot_download
 
     allow_patterns = _build_allow_patterns(reps, batches, include_crops)
+    _validate_remote_payload(hf_repo, revision, reps=reps, batches=batches)
 
     is_subset = allow_patterns is not None
     logger.info(
-        "Snapshotting HF repo %s into %s (mode=%s, crops=%s)",
-        hf_repo, DATA_DIR,
+        "Snapshotting HF repo %s (revision=%s) into %s (mode=%s, crops=%s)",
+        hf_repo,
+        revision or "main",
+        DATA_DIR,
         "subset" if is_subset else "full",
         "yes" if include_crops else "no",
     )
@@ -286,6 +376,7 @@ def download_dataset_bundle(
     snapshot_download(
         repo_id=hf_repo,
         repo_type="dataset",
+        revision=revision,
         local_dir=str(DATA_DIR),
         force_download=force,
         allow_patterns=allow_patterns,
@@ -293,6 +384,7 @@ def download_dataset_bundle(
 
     logger.info("Remapping HF layout → pipeline layout under %s ...", DATA_DIR)
     _remap_to_pipeline_layout()
+    _validate_downloaded_features(reps, batches)
 
 
 def _split_csv(values: list[str] | None) -> list[str] | None:
@@ -319,7 +411,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--rep", "--representation", action="append", default=None,
+        "--revision",
+        default=DEFAULT_HF_REVISION,
+        help=("Hugging Face branch, tag, or immutable commit SHA (default: PROT_LOC_BENCHMARK_HF_REVISION or main)."),
+    )
+    parser.add_argument(
+        "--rep",
+        "--representation",
+        action="append",
+        default=None,
         help=(
             "Restrict download to one or more representations "
             "(e.g. cytoself, cellprofiler, subcell_portable_rbg_vit). "
@@ -327,7 +427,9 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--batch", action="append", default=None,
+        "--batch",
+        action="append",
+        default=None,
         help=(
             "Restrict download to one or more batch IDs "
             "(e.g. 2025_01_27_Batch_13). Comma-separated or repeat the flag. "
@@ -346,15 +448,17 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--sample", action="store_true",
+        "--sample",
+        action="store_true",
         help=(
-            "Download only the small browseable sample subset (~1.2 GB) "
+            "Download only the small browseable sample subset (~1.24 GB) "
             "from sample/ in the HF repo, extracted under data/sample/. "
             "Mutually exclusive with --rep / --batch / --include-crops."
         ),
     )
     parser.add_argument(
-        "--force", action="store_true",
+        "--force",
+        action="store_true",
         help="Re-download even if destination already exists.",
     )
     args = parser.parse_args()
@@ -379,10 +483,11 @@ def main() -> int:
         include_crops = args.include_crops
 
     if args.sample:
-        download_sample(args.hf_repo, force=args.force)
+        download_sample(args.hf_repo, revision=args.revision, force=args.force)
     else:
         download_dataset_bundle(
             args.hf_repo,
+            revision=args.revision,
             reps=reps,
             batches=batches,
             include_crops=include_crops,
