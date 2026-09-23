@@ -6,11 +6,13 @@ split assignment, vocabulary fitting, model weights or training dependencies.
 from __future__ import annotations
 
 import hashlib
+import json
 import platform
 import re
 import subprocess
 import tarfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from prot_loc_benchmark.config import CELL_CROP_CHANNEL_FILES
@@ -60,6 +62,28 @@ def release_inventory(root, *, extra_paths=()):
         if path in manifests and sha256(local) != oid[1]:
             raise ValueError(f'Manifest differs from pinned revision: {local}')
     return {'revision': revision, 'remote': remote, 'files': files}
+
+
+def verify_crops(crops):
+    """Explicit full-payload audit; never rewrites the original extraction receipt."""
+    crops = Path(crops).resolve()
+    receipt_path = crops / 'extraction.json'
+    digest = sha256(receipt_path)
+    receipt = json.loads(receipt_path.read_text())
+    if not receipt['files']:
+        raise ValueError('Empty extraction receipt')
+    for name, expected in receipt['files'].items():
+        path = (crops / name).resolve()
+        if not path.is_relative_to(crops):
+            raise ValueError(f'Unsafe extracted path: {name}')
+        if path.stat().st_size != expected['size'] or sha256(path) != expected['sha256']:
+            raise ValueError(f'Extracted payload hash mismatch: {name}')
+    if sha256(receipt_path) != digest:
+        raise ValueError('Extraction receipt changed during verification')
+    return {'crops_root': str(crops), 'extraction_sha256': digest,
+            'revision': receipt['release']['revision'], 'files_verified': len(receipt['files']),
+            'bytes_verified': sum(info['size'] for info in receipt['files'].values()),
+            'verified_at': datetime.now(timezone.utc).isoformat(), 'invocation': invocation()}
 
 
 def extract(root, output):

@@ -1,6 +1,7 @@
 """Common crop staging needs only stdlib/git, never a model environment."""
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -61,6 +62,20 @@ class CellCropPreparationChecks(unittest.TestCase):
                         for name, info in receipt['files'].items():
                             self.assertEqual((output / name).read_bytes(), payload)
                             self.assertEqual(provenance.sha256(output / name), info['sha256'])
+                        verified = cell_crops.verify_crops(output)
+                        self.assertEqual(verified['files_verified'], 5)
+                        self.assertEqual(verified['bytes_verified'], len(payload) * 5)
+                        cli = subprocess.run([sys.executable, '-S', str(REPO_ROOT / 'scripts/01_prepare_cell_crops.py'),
+                                              'verify', '--crops', str(output)], capture_output=True, text=True)
+                        self.assertEqual(cli.returncode, 0, cli.stderr)
+                        self.assertEqual(json.loads(cli.stdout)['extraction_sha256'],
+                                         provenance.sha256(output / 'extraction.json'))
+                        changed = output / next(iter(receipt['files']))
+                        stat = changed.stat()
+                        changed.write_bytes(b'X' + payload[1:])
+                        os.utime(changed, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                        with self.assertRaisesRegex(ValueError, 'payload hash mismatch'):
+                            cell_crops.verify_crops(output)
                         with self.assertRaises(FileExistsError):
                             cell_crops.extract(release, output)
                         with self.assertRaisesRegex(ValueError, 'mirror'):
