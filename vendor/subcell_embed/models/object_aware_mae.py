@@ -155,6 +155,10 @@ class ViTMAEEmbeddings(nn.Module):
         """
         batch_size, seq_length, dim = sequence.shape
         mask_ratio = mask_ratio if mask_ratio is not None else self.config.mask_ratio
+        if mask_ratio == 0 and not self.training:
+            # Deterministic all-patch evaluation; preserve upstream training RNG.
+            ids_restore = torch.arange(seq_length, device=sequence.device).expand(batch_size, -1)
+            return sequence, sequence.new_zeros(batch_size, seq_length), ids_restore
         len_keep = int(seq_length * (1 - mask_ratio))
 
         if object_mask is not None and self.config.object_mask_ratio > 0:
