@@ -97,7 +97,7 @@ def main():
                     argv += ['-p', f'{key}={value}']
                 if controller := os.environ.get('SUBCELL_CONTROLLER_UNIT'):
                     argv += ['-p', f'BindsTo={controller}', '-p', f'After={controller}']
-                env = {'CUDA_VISIBLE_DEVICES': gpus, 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1',
+                env = {'PATH': os.environ['PATH'], 'CUDA_VISIBLE_DEVICES': gpus, 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1',
                        'OPENBLAS_NUM_THREADS': '1', 'NUMEXPR_NUM_THREADS': '1', 'OMP_THREAD_LIMIT': '1',
                        'LD_LIBRARY_PATH': '/run/opengl-driver/lib:' + os.environ.get('LD_LIBRARY_PATH', ''),
                        'PYTHONPATH': f'{ROOT}/src:{ROOT}/vendor/subcell_embed:{ROOT}/vendor/subcellportable',
