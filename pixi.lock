@@ -7942,7 +7942,7 @@ packages:
 - pypi: ./
   name: prot-loc-benchmark
   version: 0.1.0
-  sha256: cc918e10bac7422f6a7b725df6805e5655b51ac8675046b12c99ef2c5b052176
+  sha256: 85f4b87acc943965b19a515e4b01a02810c20657ba578dc986f07e4ad33c3400
   requires_python: '>=3.12'
   editable: true
 - conda: https://conda.anaconda.org/conda-forge/linux-64/protobuf-4.23.3-py310hb875b13_0.conda
