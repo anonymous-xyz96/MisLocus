@@ -417,6 +417,8 @@ class SubCellAlleleModule(L.LightningModule):
             raise ValueError('Incompatible checkpoint: protocol/config/data/seed/environment differs')
         if checkpoint['global_step'] != saved['next_pass'] * saved['steps_per_pass']:
             raise ValueError('Only completed-pass resumes are supported')
+        from .subcell_run import require_resumable
+        require_resumable(self.output_dir, checkpoint)
         self.pending_rng = saved['rng_states']
 
     def on_train_start(self):

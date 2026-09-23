@@ -1,5 +1,6 @@
 """Run: PYTHONPATH=src:vendor/subcell_embed python -m unittest discover -s tests."""
 import copy
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +21,7 @@ from prot_loc_benchmark.representations.subcell_finetune import (
 from prot_loc_benchmark.representations.subcell_manifest import align_crop_rows, sha256, split_for_plate
 from prot_loc_benchmark.representations.subcell_protocol import model_config, validate_config
 from prot_loc_benchmark.representations.subcell_training import (
-    SubCellAlleleModule, allele_metrics, load_pretrained_weights, lr_factor, optimizer_groups,
+    SubCellAlleleModule, allele_metrics, load_pretrained_weights, lr_factor, optimizer_groups, setup_transforms,
 )
 
 
@@ -145,6 +146,31 @@ class AlleleRegression(unittest.TestCase):
         draw = stratified_draw(group, 8, np.random.default_rng(8))
         self.assertEqual(len(set(draw)), 8)
         self.assertEqual(train.loc[draw].groupby('Metadata_Plate').size().tolist(), [4, 4])
+
+    def test_seed_changes_augmentation_masking_dropout_and_sampling(self):
+        embeddings = tiny_components('mae')['encoder'].embeddings
+        images = torch.linspace(0, 1, 2 * 4 * 32 * 32).reshape(2, 4, 32, 32)
+
+        def draw(seed):
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            geometry, intensity = setup_transforms()
+            first, second = geometry(images.clone()), geometry(images.clone())
+            second = intensity(second)
+            mask = embeddings.random_masking(torch.zeros(2, 784, 16), mask_ratio=.25)[1]
+            dropout = torch.nn.functional.dropout(torch.ones(512), p=.5, training=True)
+            weight = torch.nn.Linear(16, 8).weight.detach().clone()
+            return first, second, mask, dropout, weight
+
+        baseline = draw(42)
+        self.assertFalse(torch.equal(baseline[0], baseline[1]))
+        self.assertTrue(all(torch.equal(a, b) for a, b in zip(baseline, draw(42))))
+        train = self.frame.loc[self.frame.split == 'train']
+        for seed in (43, 44):
+            # Same-seed replay models shared rank streams; changing the run seed is different.
+            self.assertTrue(all(not torch.equal(a, b) for a, b in zip(baseline, draw(seed))))
+            self.assertNotEqual(list(AlleleBatchSampler(train, 42)), list(AlleleBatchSampler(train, seed)))
 
     def test_preprocessing_geometry_and_joint_normalization(self):
         preprocess = SubCellPreprocessor()

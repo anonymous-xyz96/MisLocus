@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import os
 import platform
 from pathlib import Path
 
@@ -23,6 +24,10 @@ def runtime_info():
             'cuda_matmul_allow_tf32': torch.backends.cuda.matmul.allow_tf32,
             'cudnn_allow_tf32': torch.backends.cudnn.allow_tf32,
             'cudnn_benchmark': torch.backends.cudnn.benchmark,
+            'cudnn_deterministic': torch.backends.cudnn.deterministic,
+            'deterministic_algorithms': torch.are_deterministic_algorithms_enabled(),
+            'deterministic_warn_only': torch.is_deterministic_algorithms_warn_only_enabled(),
+            'cublas_workspace_config': os.environ.get('CUBLAS_WORKSPACE_CONFIG'),
             'flash_sdp': torch.backends.cuda.flash_sdp_enabled(),
             'mem_efficient_sdp': torch.backends.cuda.mem_efficient_sdp_enabled(),
             'math_sdp': torch.backends.cuda.math_sdp_enabled()}
@@ -35,7 +40,7 @@ class AlleleCheckpoint(ModelCheckpoint):
     best checkpoint write, before last.ckpt is advanced. No second AP selector.
     """
     def __init__(self, output):
-        self.output = Path(output)
+        self.output = Path(output).resolve()
         super().__init__(dirpath=self.output / 'models', filename='best_model_ap', monitor='val/macro_ap',
                          mode='max', save_top_k=1, save_last=True, enable_version_counter=False,
                          save_on_train_epoch_end=False)
@@ -59,4 +64,26 @@ def verify_selection(checkpoint_path, checkpoint, selection_path=None):
             or receipt['global_step'] != checkpoint['global_step'] or receipt['pass'] != checkpoint['epoch'] + 1
             or checkpoint['global_step'] <= 0):
         raise ValueError('Checkpoint does not match the authoritative selection receipt')
+    state = checkpoint.get('callbacks', {}).get(AlleleCheckpoint(receipt_path.parent).state_key, {})
+    score = state.get('best_model_score')
+    if (not isinstance(score, torch.Tensor) or score.numel() != 1 or score.dtype != torch.float64
+            or not torch.isfinite(score).item() or not 0 <= score.item() <= 1
+            or receipt.get('metric_dtype') != 'float64'
+            or type(receipt.get('macro_ap')) not in (int, float) or receipt['macro_ap'] != score.item()):
+        raise ValueError('Selection score/dtype does not match the native checkpoint selector')
     return receipt
+
+
+def require_resumable(output, checkpoint):
+    """Reject terminal production runs; diagnostic probes may deliberately resume."""
+    saved = checkpoint.get('allele_v2', {})
+    if saved.get('identity', {}).get('kind') != 'production':
+        return
+    if any(Path(output).glob('attempts/*/completed.json')):
+        raise ValueError('Production run already completed; refusing to resume into its outputs')
+    if saved['next_pass'] >= 100:
+        raise ValueError('Production run reached the 100-pass horizon; refusing to resume')
+    for state in checkpoint.get('callbacks', {}).values():
+        if 'stopped_epoch' in state and (state['stopped_epoch'] > 0 or
+                state['wait_count'] >= state['patience']):
+            raise ValueError('Production run already early-stopped; refusing to resume')

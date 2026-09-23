@@ -47,6 +47,37 @@ def require_resources(resources, *, starting=False):
         raise RuntimeError('GPU memory is occupied; refusing to share a device with another job')
 
 
+def job_status(state):
+    if state['ActiveState'] in ('failed', 'inactive') or state['Result'] != 'success':
+        return 'failed'
+    if state['SubState'] == 'exited':
+        return 'success' if state['ExecMainStatus'] == '0' else 'failed'
+    return 'running' if state['SubState'] == 'running' else 'starting'
+
+
+def verify_completed_run(run, config, fingerprint):
+    # Same native-score/hash verifier as extraction. mmap keeps full model and
+    # optimizer tensors out of the small controller's resident memory.
+    import torch
+    from prot_loc_benchmark.representations.subcell_run import verify_selection
+
+    run = Path(run)
+    identity = json.loads((run / 'run.json').read_text())
+    checkpoint_path = run / 'models/best_model_ap.ckpt'
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False, mmap=True)
+    selection = verify_selection(checkpoint_path, checkpoint, run / 'selection.json')
+    del checkpoint
+    completed = [json.loads(p.read_text()) for p in run.glob('attempts/*/completed.json')]
+    if (identity['kind'] != 'production' or identity['code_sha256'] != fingerprint
+            or identity['config'] != config or selection['identity'] != identity
+            or not any(c.get('identity') == identity and c.get('status') == 'fit_completed'
+                       and c.get('selection') == selection
+                       and c.get('global_step', -1) >= selection['global_step'] for c in completed)):
+        raise RuntimeError('Production completion/selection binding mismatch')
+    verify_source(run, fingerprint)
+    return selection
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--preflight', type=Path, required=True)
@@ -117,6 +148,7 @@ def main():
                         'ActiveState,SubState,ExecMainStatus,Result,MemoryCurrent,MemoryPeak,CPUUsageNSec,TasksCurrent,ControlGroup'], text=True)
                     state = dict(line.split('=', 1) for line in text.splitlines())
                     tracker['jobs'][name]['systemd'] = state
+                    tracker['jobs'][name]['status'] = job_status(state)
                     cg = Path('/sys/fs/cgroup') / state['ControlGroup'].lstrip('/')
                     if (cg / 'memory.max').exists():
                         applied = {k: (cg / k).read_text().strip() for k in ('memory.max', 'memory.high', 'cpu.max', 'pids.max')}
@@ -124,13 +156,12 @@ def main():
                                        'cpu.max': '1600000 100000', 'pids.max': '512'}:
                             raise RuntimeError(f'Resource limits were not applied: {applied}')
                         tracker['jobs'][name]['applied_limits'] = applied
-                    if state['SubState'] == 'exited' and state['ExecMainStatus'] == '0':
+                    if tracker['jobs'][name]['status'] == 'success':
                         if 'applied_limits' not in tracker['jobs'][name]:
                             raise RuntimeError(f'No verified resource-limit receipt for {name}')
-                        tracker['jobs'][name]['status'] = 'success'
                         subprocess.run(['systemctl', '--user', 'stop', unit], check=True)
                         del active[name]
-                    elif state['ActiveState'] in ('failed', 'inactive'):
+                    elif tracker['jobs'][name]['status'] == 'failed':
                         raise RuntimeError(f'{name} failed: {state}')
                 with (args.output / 'resources.jsonl').open('a') as stream:
                     stream.write(json.dumps({'time': time.time(), **resources, 'jobs': tracker['jobs']}) + '\n')
@@ -188,15 +219,7 @@ def main():
                           for family, gpus in (('mae', '0,1'), ('vit', '2,3'))})
                 for family in ('mae', 'vit'):
                     run = args.output / 'runs' / f'{family}-s{seed}'
-                    identity = json.loads((run / 'run.json').read_text())
-                    selection = json.loads((run / 'selection.json').read_text())
-                    if (identity['kind'] != 'production' or identity['code_sha256'] != fingerprint
-                            or identity['config'] != tracker['configs'][f'{family}-s{seed}']['resolved']
-                            or selection['identity'] != identity
-                            or selection['sha256'] != sha256(run / selection['checkpoint'])
-                            or not list(run.glob('attempts/*/completed.json'))):
-                        raise RuntimeError('Production completion/selection binding mismatch')
-                    verify_source(run, fingerprint)
+                    verify_completed_run(run, tracker['configs'][f'{family}-s{seed}']['resolved'], fingerprint)
         update('complete')
     except BaseException as error:
         tracker['error'] = repr(error)

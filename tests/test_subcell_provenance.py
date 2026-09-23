@@ -20,7 +20,9 @@ from prot_loc_benchmark.config import ALL_PUBLIC_BATCHES, REPO_ROOT, SUBCELL_CHA
 from prot_loc_benchmark.representations.subcell_manifest import (
     build_manifest, load_preflight, save_json, sha256,
 )
-from prot_loc_benchmark.representations.subcell_run import AlleleCheckpoint, capture_source, verify_selection, verify_source
+from prot_loc_benchmark.representations.subcell_run import (
+    AlleleCheckpoint, capture_source, require_resumable, runtime_info, verify_selection, verify_source,
+)
 
 
 def stage_fixture(root):
@@ -137,15 +139,67 @@ class ProvenanceChecks(unittest.TestCase):
                 self.assertIn('src/prot_loc_benchmark/representations/subcell_training.py', names)
                 self.assertNotIn('data', names)
             identity = {'config': {'output': str(root)}}
-            checkpoint = {'global_step': 970, 'epoch': 9, 'allele_v2': {'identity': identity}}
+            selector = AlleleCheckpoint(root)
+            selector.best_model_score = torch.tensor(.123456789, dtype=torch.float64)
+            checkpoint = {'global_step': 970, 'epoch': 9, 'allele_v2': {'identity': identity},
+                          'callbacks': {selector.state_key: selector.state_dict()}}
             path = root / 'best.ckpt'
             torch.save(checkpoint, path)
-            save_json(root / 'selection.json', {'identity': identity, 'sha256': sha256(path), 'pass': 10,
-                                              'global_step': 970, 'macro_ap': .123456789})
+            receipt = {'identity': identity, 'sha256': sha256(path), 'pass': 10, 'global_step': 970,
+                       'macro_ap': .123456789, 'metric_dtype': 'float64'}
+            save_json(root / 'selection.json', receipt)
             verify_selection(path, checkpoint)
+            archived_receipt = root / 'archived-selection.json'
+            for change in ({'macro_ap': .987654321}, {'metric_dtype': 'float32'}):
+                save_json(archived_receipt, {**receipt, **change})
+                with self.assertRaisesRegex(ValueError, 'native checkpoint selector'):
+                    verify_selection(path, checkpoint, archived_receipt)
+            for native_score in (None, torch.tensor(.123456789), torch.tensor(float('nan'), dtype=torch.float64)):
+                altered = {**checkpoint, 'callbacks': {selector.state_key: {'best_model_score': native_score}}}
+                with self.assertRaisesRegex(ValueError, 'native checkpoint selector'):
+                    verify_selection(path, altered)
+            save_json(archived_receipt, receipt)
+            verify_selection(path, checkpoint, archived_receipt)
             path.write_bytes(path.read_bytes() + b'changed')
             with self.assertRaisesRegex(ValueError, 'authoritative'):
                 verify_selection(path, checkpoint)
+
+    def test_terminal_production_resume_and_backend_metadata(self):
+        from test_subcell_allele_v2 import tiny_components
+        from prot_loc_benchmark.representations.subcell_training import SubCellAlleleModule
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = {'kind': 'production'}
+            checkpoint = {'global_step': 970, 'allele_v2': {'identity': identity, 'next_pass': 10,
+                          'steps_per_pass': 97, 'rng_states': []}, 'callbacks': {}}
+            module = SubCellAlleleModule(tiny_components('vit'), ['a', 'b'], identity, root, augment=False)
+            module.on_load_checkpoint(checkpoint)  # An interrupted nonterminal pass can resume.
+            marker = root / 'attempts/first/completed.json'
+            marker.parent.mkdir(parents=True)
+            marker.write_text('completed sentinel')
+            with self.assertRaisesRegex(ValueError, 'already completed'):
+                module.on_load_checkpoint(checkpoint)
+            self.assertEqual(marker.read_text(), 'completed sentinel')
+            marker.unlink()
+            checkpoint['allele_v2']['next_pass'] = 100
+            checkpoint['global_step'] = 9700
+            with self.assertRaisesRegex(ValueError, '100-pass horizon'):
+                module.on_load_checkpoint(checkpoint)
+            checkpoint['allele_v2']['next_pass'] = 60
+            checkpoint['global_step'] = 5820
+            stopping = EarlyStopping('val/macro_ap', patience=5, mode='max')
+            for stopped_epoch, wait_count in ((59, 1), (0, 5)):
+                state = {**stopping.state_dict(), 'stopped_epoch': stopped_epoch, 'wait_count': wait_count}
+                checkpoint['callbacks'] = {stopping.state_key: state}
+                with self.assertRaisesRegex(ValueError, 'already early-stopped'):
+                    module.on_load_checkpoint(checkpoint)
+            checkpoint['allele_v2']['identity'] = {'kind': 'release_validation'}
+            require_resumable(root, checkpoint)  # Diagnostic stop/resume gates remain possible.
+        runtime = runtime_info()
+        self.assertEqual(runtime['cudnn_deterministic'], torch.backends.cudnn.deterministic)
+        self.assertEqual(runtime['deterministic_algorithms'], torch.are_deterministic_algorithms_enabled())
+        self.assertEqual(runtime['deterministic_warn_only'], torch.is_deterministic_algorithms_warn_only_enabled())
+        self.assertEqual(runtime['cublas_workspace_config'], os.environ.get('CUBLAS_WORKSPACE_CONFIG'))
 
     def test_native_selector_ties_small_improvements_and_early_stopping(self):
         with tempfile.TemporaryDirectory() as directory:

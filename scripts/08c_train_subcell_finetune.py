@@ -28,7 +28,7 @@ from prot_loc_benchmark.representations.subcell_training import (
     AlleleDataModule, SubCellAlleleModule, load_pretrained_weights, enable_checkpointing,
 )
 from prot_loc_benchmark.representations.subcell_run import (
-    AlleleCheckpoint, capture_source, code_fingerprint, runtime_info, verify_source,
+    AlleleCheckpoint, capture_source, code_fingerprint, require_resumable, runtime_info, verify_source,
 )
 
 
@@ -44,7 +44,8 @@ class StopAfterUpdates(Callback):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('-c', '--config', type=Path, required=True)
-    parser.add_argument('--resume', type=Path, help='Explicit compatible completed-pass checkpoint only')
+    parser.add_argument('--resume', type=Path,
+                        help='Compatible last.ckpt from an interrupted run at a pass boundary; finished runs are rejected')
     parser.add_argument('--fit', action='store_true', help='Start training AFTER review and readiness gates')
     parser.add_argument('--smoke-updates', type=int, help='Bounded diagnostic only; no selectable checkpoints')
     args = parser.parse_args()
@@ -88,6 +89,7 @@ def main():
         # Only the latest completed checkpoint may resume into this output directory.
         if args.resume.resolve() != (output / 'models/last.ckpt').resolve():
             raise ValueError('Resume must explicitly name this run\'s last.ckpt; do not overwrite later results')
+        require_resumable(output, checkpoint)
         del checkpoint
     elif int(os.environ.get('RANK', '0')) == 0:
         output.mkdir(parents=True, exist_ok=False)
