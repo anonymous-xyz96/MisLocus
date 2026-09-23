@@ -17,6 +17,9 @@ requires = ["hatchling"]
 channels = ["conda-forge", "bioconda", "pytorch"]
 platforms = ["linux-64"]
 
+[tool.pixi.tasks]
+prepare-cell-crops = "python scripts/01_prepare_cell_crops.py"
+
 # ============================================================================
 # ENVIRONMENT: default (preprocessing + classification + benchmarks, CPU only)
 # ============================================================================
@@ -135,7 +138,8 @@ torcheval = ">=0.0.7"
 cuda = "12.4"
 
 [tool.pixi.feature.subcell.tasks]
-extract-subcell          = "python scripts/08a_extract_subcell_embeddings.py"
+prepare-subcell          = "python scripts/08a_prepare_subcell.py"
+extract-subcell          = "python scripts/08b_extract_subcell_embeddings.py"
 train-subcell-finetune   = "python scripts/08c_train_subcell_finetune.py"
 extract-subcell-finetune = "python scripts/08d_extract_subcell_finetune_embeddings.py"
 
