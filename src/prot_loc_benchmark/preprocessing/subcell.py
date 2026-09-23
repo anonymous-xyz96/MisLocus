@@ -1,7 +1,7 @@
 """SubCell-specific preprocessing utilities (rescale → crop → normalize).
 
 Used by:
-  - scripts/08a_extract_subcell_embeddings.py (frozen inference)
+  - scripts/08b_extract_subcell_embeddings.py (frozen inference)
   - scripts/08d_extract_subcell_finetune_embeddings.py (fine-tuned inference)
   - src/prot_loc_benchmark/representations/subcell_finetune.py (training dataset)
 """
@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+
+from prot_loc_benchmark.config import SUBCELL_SCALE_FACTOR
 
 
 class SubCellPreprocessor:
@@ -31,10 +33,11 @@ class SubCellPreprocessor:
 
     def __init__(
         self,
-        scale_factor: float = 7.47,
+        scale_factor: float = SUBCELL_SCALE_FACTOR,
         input_size: int = 128,
         output_size: int = 448,
     ):
+        self.input_size = input_size
         self.scale_factor = scale_factor
         self.rescaled_size = int(input_size * scale_factor)
         self.output_size = output_size
@@ -65,6 +68,10 @@ class SubCellPreprocessor:
             Preprocessed images of shape (N, C, output_size, output_size),
             float32, normalized to [0, 1].
         """
+        if tensor.ndim != 4 or tensor.shape[-2:] != (self.input_size, self.input_size):
+            raise ValueError('Invalid native SubCell crop geometry')
+        if tensor.dtype != torch.float32 or not torch.isfinite(tensor).all():
+            raise ValueError('SubCell preprocessing requires finite float32 inputs')
         x = F.interpolate(
             tensor, size=self.rescaled_size, mode="bilinear", align_corners=False
         )
