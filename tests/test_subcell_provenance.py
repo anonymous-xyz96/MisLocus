@@ -110,6 +110,38 @@ class ProvenanceChecks(unittest.TestCase):
                         inventory.assert_not_called()
                         self.assertEqual(set(root.rglob('*')), before)
 
+    def test_preflight_rejects_receipt_or_source_edits_during_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, crops, cohort = stage_fixture(root)
+            inventory = json.loads((cohort / 'preflight.json').read_text())['release']
+            receipt_path = crops / 'extraction.json'
+            original_receipt = receipt_path.read_bytes()
+            source = root / 'editable-source'
+            source.mkdir()
+            read = pd.read_parquet
+            for change in ('receipt', 'source'):
+                for name in ('pixi.lock', 'pyproject.toml'):
+                    (source / name).write_text('before')
+
+                def read_then_edit(*args, **kwargs):
+                    result = read(*args, **kwargs)
+                    if change == 'receipt':
+                        receipt_path.write_text('{"release": {"revision": "other"}, "files": {}}')
+                    else:
+                        (source / 'pixi.lock').write_text('after')
+                    return result
+
+                output = root / ('changed-' + change)
+                with self.subTest(change=change), patch.object(provenance, 'REPO_ROOT', source), patch.object(
+                        provenance.subprocess, 'check_output', return_value='fixture'), patch.object(
+                        pd, 'read_parquet', side_effect=read_then_edit), patch(
+                        'prot_loc_benchmark.representations.subcell_manifest.release_inventory', return_value=inventory):
+                    with self.assertRaisesRegex(ValueError, 'Extraction receipt changed|recorded code identity'):
+                        build_manifest(release, crops, output)
+                    self.assertFalse((output / 'preflight.json').exists())
+                receipt_path.write_bytes(original_receipt)
+
     def test_separate_extraction_preflight_and_tamper_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
