@@ -15,7 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from prot_loc_benchmark.config import CELL_CROP_CHANNEL_FILES
-from prot_loc_benchmark.provenance import capture_source, invocation, record, save_json, sha256, read_json_with_hash
+from prot_loc_benchmark.provenance import (
+    capture_source, invocation, record, save_json, sha256, read_json_with_hash, code_fingerprint, verify_source,
+)
 
 
 class _HashingReader:
@@ -102,9 +104,11 @@ def extract(root, output):
     if output.is_relative_to(root):
         raise ValueError('Extraction must not write inside the Hugging Face mirror')
     started = time.perf_counter()
+    source_fingerprint = code_fingerprint()
     inventory = release_inventory(root)
     output.mkdir(parents=True, exist_ok=False)
     capture_source(output)
+    verify_source(output, source_fingerprint)
     files = {}
     archives = []
     for relative, expected in inventory['files'].items():
