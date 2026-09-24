@@ -44,6 +44,9 @@ class CellCropPreparationChecks(unittest.TestCase):
                             member.type = tarfile.SYMTYPE
                             member.linkname = '/outside'
                         archive.addfile(member, io.BytesIO())
+                # Pinned trailing bytes must also be hashed after tar reaches its end marker.
+                with archive_path.open('ab') as stream:
+                    stream.write(b'\0' * 20000)
                 digest = provenance.sha256(archive_path)
                 inventory = {'remote': 'synthetic', 'revision': 'fixture',
                              'files': {relative: {'sha256': digest, 'size': archive_path.stat().st_size}}}
@@ -80,6 +83,21 @@ class CellCropPreparationChecks(unittest.TestCase):
                             cell_crops.extract(release, output)
                         with self.assertRaisesRegex(ValueError, 'mirror'):
                             cell_crops.extract(release, release / 'forbidden')
+                        original_archive = archive_path.read_bytes()
+                        checksum = cell_crops.sha256
+
+                        def checksum_then_replace(path):
+                            result = checksum(path)
+                            if path == archive_path:
+                                path.write_bytes(original_archive + b'changed after checksum')
+                            return result
+
+                        replaced = root / 'replaced-shard'
+                        with patch.object(cell_crops, 'sha256', side_effect=checksum_then_replace):
+                            with self.assertRaisesRegex(ValueError, 'Consumed shard'):
+                                cell_crops.extract(release, replaced)
+                        self.assertFalse((replaced / 'extraction.json').exists())
+                        archive_path.write_bytes(original_archive)
                         source = root / 'editable-source'
                         source.mkdir()
                         for name in ('pixi.lock', 'pyproject.toml'):
