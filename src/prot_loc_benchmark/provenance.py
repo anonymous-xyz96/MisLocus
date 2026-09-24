@@ -46,6 +46,12 @@ def sha256(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def read_json_with_hash(path):
+    """Parse and identify one byte buffer, never two independent file reads."""
+    content = Path(path).read_bytes()
+    return json.loads(content), hashlib.sha256(content).hexdigest()
+
+
 def save_json(path, value):
     path = Path(path)
     content = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + '\n'
