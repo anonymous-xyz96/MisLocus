@@ -20,7 +20,9 @@ from prot_loc_benchmark.config import ALL_PUBLIC_BATCHES, REPO_ROOT, SUBCELL_CHA
 from prot_loc_benchmark.representations.subcell_manifest import (
     build_manifest, load_preflight, save_json, sha256,
 )
-from prot_loc_benchmark.representations.subcell_run import capture_source, runtime_info, verify_source
+from prot_loc_benchmark.representations.subcell_run import (
+    AlleleCheckpoint, capture_source, require_resumable, runtime_info, verify_selection, verify_source,
+)
 
 
 def stage_fixture(root):
@@ -112,6 +114,65 @@ class ProvenanceChecks(unittest.TestCase):
             os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
             with self.assertRaisesRegex(ValueError, 'changed after preflight'):
                 load_preflight(cohort)
+
+    def test_source_snapshot_and_authoritative_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture_source(root)
+            source = json.loads((root / 'source.json').read_text())
+            self.assertEqual(source['archive_sha256'], sha256(root / 'source.tar.gz'))
+            verify_source(root, source['code_sha256'])
+            with self.assertRaisesRegex(ValueError, 'recorded code identity'):
+                verify_source(root, '0' * 64)
+            with tarfile.open(root / 'source.tar.gz') as archive:
+                names = archive.getnames()
+                self.assertIn('scripts/08d_extract_subcell_finetune_embeddings.py', names)
+                self.assertIn('src/prot_loc_benchmark/representations/subcell_training.py', names)
+                self.assertNotIn('data', names)
+            identity = {'config': {'output': str(root)}}
+            selector = AlleleCheckpoint(root)
+            selector.best_model_score = torch.tensor(.123456789, dtype=torch.float64)
+            checkpoint = {'global_step': 970, 'epoch': 9, 'allele_v2': {'identity': identity},
+                          'callbacks': {selector.state_key: selector.state_dict()}}
+            path = root / 'best.ckpt'
+            torch.save(checkpoint, path)
+            receipt = {'identity': identity, 'sha256': sha256(path), 'pass': 10, 'global_step': 970,
+                       'macro_ap': .123456789, 'metric_dtype': 'float64'}
+            save_json(root / 'selection.json', receipt)
+            verify_selection(path, checkpoint)
+            archived_receipt = root / 'archived-selection.json'
+            for change in ({'macro_ap': .987654321}, {'metric_dtype': 'float32'}):
+                save_json(archived_receipt, {**receipt, **change})
+                with self.assertRaisesRegex(ValueError, 'native checkpoint selector'):
+                    verify_selection(path, checkpoint, archived_receipt)
+            for native_score in (None, torch.tensor(.123456789), torch.tensor(float('nan'), dtype=torch.float64)):
+                altered = {**checkpoint, 'callbacks': {selector.state_key: {'best_model_score': native_score}}}
+                with self.assertRaisesRegex(ValueError, 'native checkpoint selector'):
+                    verify_selection(path, altered)
+            save_json(archived_receipt, receipt)
+            verify_selection(path, checkpoint, archived_receipt)
+            path.write_bytes(path.read_bytes() + b'changed')
+            with self.assertRaisesRegex(ValueError, 'authoritative'):
+                verify_selection(path, checkpoint)
+
+
+    def test_native_selector_ties_small_improvements_and_early_stopping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = AlleleCheckpoint(directory)
+            trainer = SimpleNamespace(strategy=SimpleNamespace(reduce_boolean_decision=lambda value: value))
+            checkpoint.best_k_models = {'best': torch.tensor(.123456789, dtype=torch.float64)}
+            checkpoint.kth_value = checkpoint.best_k_models['best']
+            checkpoint.kth_best_model_path = 'best'
+            self.assertFalse(checkpoint.check_monitor_top_k(trainer, torch.tensor(.123456789, dtype=torch.float64)))
+            self.assertTrue(checkpoint.check_monitor_top_k(trainer, torch.tensor(.123456790, dtype=torch.float64)))
+            stopping = EarlyStopping('val/macro_ap', mode='max', min_delta=.001, patience=5)
+            self.assertFalse(stopping._evaluate_stopping_criteria(torch.tensor(.5, dtype=torch.float64))[0])
+            for value in (.5001, .5002, .5003):
+                self.assertFalse(stopping._evaluate_stopping_criteria(torch.tensor(value, dtype=torch.float64))[0])
+            resumed = EarlyStopping('val/macro_ap', mode='max', min_delta=.001, patience=5)
+            resumed.load_state_dict(stopping.state_dict())
+            self.assertFalse(resumed._evaluate_stopping_criteria(torch.tensor(.5004, dtype=torch.float64))[0])
+            self.assertTrue(resumed._evaluate_stopping_criteria(torch.tensor(.5005, dtype=torch.float64))[0])
 
 
 if __name__ == '__main__':
