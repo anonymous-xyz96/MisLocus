@@ -136,6 +136,12 @@ class ReviewRegressions(unittest.TestCase):
             )
         self.assertTrue(result.empty)
 
+    def test_summary_consumer_refuses_an_omitted_requested_representation(self):
+        module = load_script(REPO_ROOT / "scripts/11_summarize_across_reps.py", "review_summary_consumer")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(FileNotFoundError, "Missing requested"):
+                module.load_per_rep_summaries(Path(directory), ["missing"])
+
     def test_new_t4_controls_only_run_cannot_fall_back_to_legacy_or_empty_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -178,6 +184,38 @@ class ReviewRegressions(unittest.TestCase):
                     load_single_fold_metrics("vit", "batch", classification_dir=root)
             self.assertEqual(result["auroc_std"].dtype, pl.Float64)
             self.assertIsNone(result["auroc_std"].mean())
+
+    def test_pa_consumer_selects_verified_t4_outputs_and_rejects_missing_batches(self):
+        module = load_script(REPO_ROOT / "scripts/10_benchmark_clinvar.py", "review_pa_consumer")
+        rep = "subcell_allele_rybg_v2_mae_s42"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Test the consumer, not a production resource allocation or real producer.
+            with (
+                patch.object(stages, "DATA_DIR", root),
+                patch.object(stages, "require_bounded_execution", return_value={}),
+                patch.object(provenance, "PROVENANCE_LOG", root / "ledger.json"),
+                patch.dict(os.environ, {"MISLOCUS_DATA_ROOT": str(root)}),
+                patch.object(module, "CLASSIFICATION_PA_DIR", root / "classification_PA"),
+            ):
+                for batch in ("a", "b", "full"):
+                    path = root / "classification_PA" / (rep + "_t4") / batch
+                    # A complete all-query run filed under _t4 must not be relabeled.
+                    split = "none" if batch == "full" else "t4"
+                    with stages.stage(path, [], {"representation": rep, "batch": batch, "test_split": split}):
+                        pl.DataFrame(
+                            {"Metadata_gene_allele": ["G_v"], "channel": ["EMBED"], "mAP_vs_ref_norm": [0.7]}
+                        ).write_parquet(path / "mAP_results.parquet")
+                loaded = module.load_pa_metrics([rep], {"pair": ("a", "b")}, fold_mode="t4-only")
+                self.assertEqual(loaded["channel"].to_list(), ["EMBED_vs_ref"] * 2)
+                self.assertEqual(loaded["representation"].unique().to_list(), [rep])
+                with self.assertRaisesRegex(ValueError, "T4-query protocol"):
+                    module.load_pa_metrics([rep], {"pair": ("a", "full")}, fold_mode="t4-only")
+                with self.assertRaisesRegex(ValueError, "Missing"):
+                    module.load_pa_metrics([rep], {"pair": ("a", "missing")}, fold_mode="t4-only")
+                (root / "classification_PA" / (rep + "_t4") / "b/stage.json").unlink()
+                with self.assertRaisesRegex(ValueError, "Missing"):
+                    module.load_pa_metrics([rep], {"pair": ("a", "b")}, fold_mode="t4-only")
 
 
 if __name__ == "__main__":
