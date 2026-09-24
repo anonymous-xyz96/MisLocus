@@ -6,7 +6,6 @@ split assignment, vocabulary fitting, model weights or training dependencies.
 from __future__ import annotations
 
 import hashlib
-import json
 import platform
 import re
 import subprocess
@@ -16,7 +15,19 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from prot_loc_benchmark.config import CELL_CROP_CHANNEL_FILES
-from prot_loc_benchmark.provenance import capture_source, invocation, record, save_json, sha256
+from prot_loc_benchmark.provenance import capture_source, invocation, record, save_json, sha256, read_json_with_hash
+
+
+class _HashingReader:
+    """Hash the compressed bytes consumed by the tar parser, including its read-ahead."""
+    def __init__(self, stream):
+        self.stream = stream
+        self.digest = hashlib.sha256()
+
+    def read(self, size):
+        content = self.stream.read(size)
+        self.digest.update(content)
+        return content
 
 
 def release_inventory(root, *, extra_paths=()):
@@ -68,8 +79,7 @@ def verify_crops(crops):
     """Explicit full-payload audit; never rewrites the original extraction receipt."""
     crops = Path(crops).resolve()
     receipt_path = crops / 'extraction.json'
-    digest = sha256(receipt_path)
-    receipt = json.loads(receipt_path.read_text())
+    receipt, digest = read_json_with_hash(receipt_path)
     if not receipt['files']:
         raise ValueError('Empty extraction receipt')
     for name, expected in receipt['files'].items():
@@ -106,7 +116,8 @@ def extract(root, output):
         if sha256(archive) != expected['sha256']:
             raise ValueError(f'Shard hash differs from pinned release: {archive}')
         batch = relative.split('/')[1]
-        with tarfile.open(archive, 'r|gz') as tar:
+        with archive.open('rb') as stream, tarfile.open(
+                fileobj=(reader := _HashingReader(stream)), mode='r|gz') as tar:
             for member in tar:
                 parts = PurePosixPath(member.name).parts
                 if '..' in parts or PurePosixPath(member.name).is_absolute():
@@ -128,6 +139,11 @@ def extract(root, output):
                     raise ValueError(f'Truncated extraction: {destination}')
                 files[str(destination.relative_to(output))] = {
                     'sha256': digest.hexdigest(), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
+            # Tar stops at its end marker, but the pinned hash covers the whole shard.
+            while reader.read(8 * 1024 * 1024):
+                pass
+            if reader.digest.hexdigest() != expected['sha256']:
+                raise ValueError(f'Consumed shard differs from pinned release: {archive}')
     # The ledger indexes attempts; only the last-written receipt marks completion.
     record([output], input_paths=archives, duration_seconds=time.perf_counter() - started)
     # No model eligibility or normalization decisions are made by this receipt.
