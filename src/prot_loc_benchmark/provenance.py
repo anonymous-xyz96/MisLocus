@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import io
 import json
 import logging
 import subprocess
@@ -78,11 +79,20 @@ def capture_source(output):
     """Keep actual source, including uncommitted/untracked implementation, not just HEAD."""
     output = Path(output)
     path = output / 'source.tar.gz'
+    manifest, digest = {}, hashlib.sha256()
     with tarfile.open(path, 'x:gz') as archive:
         for source in source_files():
-            archive.add(source, arcname=str(source.relative_to(REPO_ROOT)), recursive=False)
-    manifest = {str(p.relative_to(REPO_ROOT)): sha256(p) for p in source_files()}
-    save_json(output / 'source.json', {'code_sha256': code_fingerprint(), 'archive_sha256': sha256(path),
+            name = str(source.relative_to(REPO_ROOT))
+            content = source.read_bytes()
+            member = archive.gettarinfo(str(source), arcname=name)
+            if not member.isfile():
+                raise ValueError(f'Source must be a regular file: {source}')
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+            manifest[name] = hashlib.sha256(content).hexdigest()
+            digest.update(name.encode())
+            digest.update(content)
+    save_json(output / 'source.json', {'code_sha256': digest.hexdigest(), 'archive_sha256': sha256(path),
                                       'files': manifest,
                                       'git_head': subprocess.check_output(['git', '-C', str(REPO_ROOT), 'rev-parse', 'HEAD'], text=True).strip(),
                                       'git_status': subprocess.check_output(['git', '-C', str(REPO_ROOT), 'status', '--porcelain'], text=True)})
@@ -108,8 +118,15 @@ def verify_source(output, expected_code_sha256):
         raise ValueError('Archived source does not match the recorded code identity')
 
 
-def invocation():
-    return {'argv': sys.argv, 'working_directory': str(Path.cwd()), 'code_sha256': code_fingerprint()}
+def invocation(snapshot=None):
+    """Bind a captured source identity, rejecting live source drift when supplied."""
+    fingerprint = code_fingerprint()
+    if snapshot is not None:
+        captured = json.loads((Path(snapshot) / 'source.json').read_text())['code_sha256']
+        if fingerprint != captured:
+            raise ValueError('Source changed since capture; refusing to publish completion')
+        fingerprint = captured
+    return {'argv': sys.argv, 'working_directory': str(Path.cwd()), 'code_sha256': fingerprint}
 
 
 # ---------------------------------------------------------------------------

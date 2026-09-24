@@ -97,6 +97,7 @@ def main():
     (args.output / 'logs').mkdir()
     capture_source(args.output)
     fingerprint = code_fingerprint()
+    verify_source(args.output, fingerprint)
     tracker = {'started_at': datetime.now(timezone.utc).isoformat(), 'argv': sys.argv,
                'git_head': subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip(),
                'code_sha256': fingerprint, 'source_archive_sha256': sha256(args.output / 'source.tar.gz'),
