@@ -14,7 +14,7 @@ import pandas as pd
 
 from prot_loc_benchmark.config import ALL_PUBLIC_BATCHES, SUBCELL_CHANNEL_FILES
 from prot_loc_benchmark.cell_crops import release_inventory as crop_inventory
-from prot_loc_benchmark.provenance import save_json, sha256
+from prot_loc_benchmark.provenance import save_json, sha256, read_json_with_hash
 
 PROTOCOL = 'subcell-allele-rybg-v2'
 IDENTITY = ['Metadata_CellID', 'Metadata_Plate', 'Metadata_Well',
@@ -123,17 +123,18 @@ def align_crop_rows(released, base_path):
 def build_manifest(root, crops, output):
     """Validate a completed extraction and save immutable cohort + fixed validation IDs."""
     from .subcell_finetune import fixed_validation
-    from .subcell_run import capture_source, invocation
+    from .subcell_run import capture_source, invocation, code_fingerprint, verify_source
 
     root, crops, output = (Path(p).resolve() for p in (root, crops, output))
     if any(output.is_relative_to(p) for p in (root, crops)):
         raise ValueError('Preflight must not write inside the Hugging Face mirror or crop inputs')
+    source_fingerprint = code_fingerprint()
     inventory = release_inventory(root)
     receipt_path = crops / 'extraction.json'
     if not receipt_path.exists():
         raise ValueError('No completed extraction.json; tar shards are not mmap training data. '
                          'Use 01_prepare_cell_crops.py extract into a NEW directory first.')
-    receipt = json.loads(receipt_path.read_text())
+    receipt, receipt_digest = read_json_with_hash(receipt_path)
     recorded = receipt['release']
     required = {p for p in inventory['files'] if p.startswith(('manifest/', 'single_cell_crops/'))}
     # Accept both shared crop-only receipts and earlier receipts that also pinned
@@ -163,16 +164,19 @@ def build_manifest(root, crops, output):
     # Create only after ALL checks pass; never overwrite an earlier preflight.
     output.mkdir(parents=True, exist_ok=False)
     capture_source(output)
+    verify_source(output, source_fingerprint)
     frame.to_parquet(output / 'manifest.parquet', index=False)
     save_json(output / 'class_index.json', classes)
     save_json(output / 'validation_ids.json', validation)
     frame.groupby(['batch_id', 'Metadata_Plate', 'split', 'Metadata_gene_allele']).size().rename('cells').to_csv(
         output / 'counts.csv')
+    if sha256(receipt_path) != receipt_digest:
+        raise ValueError('Extraction receipt changed during preflight')
     save_json(output / 'preflight.json', {
         'protocol': PROTOCOL, 'release': inventory, 'release_root': str(root.resolve()),
         'crops_root': str(crops.resolve()),
         'invocation': invocation(output), 'source_archive_sha256': sha256(output / 'source.tar.gz'),
-        'extraction_sha256': sha256(receipt_path),
+        'extraction_sha256': receipt_digest,
         'manifest_sha256': sha256(output / 'manifest.parquet'),
         'class_index_sha256': sha256(output / 'class_index.json'),
         'validation_ids_sha256': sha256(output / 'validation_ids.json'),
@@ -194,9 +198,9 @@ def load_preflight(path):
             raise ValueError(f'Preflight artifact changed: {filename}')
     crops = Path(evidence['crops_root'])
     receipt_path = crops / 'extraction.json'
-    if sha256(receipt_path) != evidence['extraction_sha256']:
+    receipt, receipt_digest = read_json_with_hash(receipt_path)
+    if receipt_digest != evidence['extraction_sha256']:
         raise ValueError('Extraction receipt changed after preflight')
-    receipt = json.loads(receipt_path.read_text())
     for name, info in receipt['files'].items():
         stat = (crops / name).stat()
         if stat.st_size != info['size'] or stat.st_mtime_ns != info['mtime_ns']:
