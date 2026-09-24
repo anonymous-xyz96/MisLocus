@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import polars as pl
@@ -148,6 +149,24 @@ class Safeguards(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "compute clients"):
                     with allocated_gpu("cuda:0"):
                         pass
+
+    def test_unexpected_skipped_classifier_aborts_instead_of_publishing_partial_results(self):
+        from prot_loc_benchmark.classification.executor import _run_classifier
+
+        train = pl.DataFrame({CELL_ID: ["train/1", "train/2"], "f": [1.0, 2.0], "Label": [1, 1]})
+        test = pl.DataFrame({CELL_ID: ["test/1", "test/2"], "f": [1.0, 2.0], "Label": [0, 1]})
+        task = {
+            "train_df": train,
+            "test_df": test,
+            "ch_features": ["f"],
+            "channel": "EMBED",
+            "pair": SimpleNamespace(pair_id="p"),
+            "fold": SimpleNamespace(fold_id="t4"),
+        }
+        with self.assertRaisesRegex(ValueError, "produced no fit"):
+            _run_classifier(task, "cpu", Path("unused-model-directory"))
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            _run_classifier({**task, "test_df": train}, "cpu", Path("unused-model-directory"))
 
     def test_unbounded_production_is_rejected_before_data_work(self):
         with patch.object(
