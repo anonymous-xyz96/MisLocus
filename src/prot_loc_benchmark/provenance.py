@@ -27,7 +27,8 @@ import logging
 import subprocess
 import sys
 import tarfile
-from datetime import datetime, timezone
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from prot_loc_benchmark.config import DATA_DIR, REPO_ROOT
@@ -41,9 +42,10 @@ SCHEMA_VERSION = 1
 # Default file suffixes to skip when scanning output directories
 SKIP_SUFFIXES = frozenset({".png", ".pdf", ".log"})
 
+
 def sha256(path):
-    with open(path, 'rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    with open(path, "rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def read_json_with_hash(path):
@@ -54,20 +56,21 @@ def read_json_with_hash(path):
 
 def save_json(path, value):
     path = Path(path)
-    content = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + '\n'
-    temporary = path.with_name(path.name + '.tmp')
+    content = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(content)
     temporary.replace(path)
 
 
 def source_files():
     paths = []
-    for directory in ('src', 'scripts', 'configs', 'tests', 'vendor/subcell_embed', 'vendor/subcellportable'):
-        paths.extend(p for p in (REPO_ROOT / directory).rglob('*')
-                     if p.is_file() and p.suffix in ('.py', '.yaml', '.md'))
-    paths.extend(REPO_ROOT / p for p in ('pyproject.toml', 'pixi.lock'))
+    for directory in ("src", "scripts", "configs", "tests", "vendor/subcell_embed", "vendor/subcellportable"):
+        paths.extend(
+            p for p in (REPO_ROOT / directory).rglob("*") if p.is_file() and p.suffix in (".py", ".yaml", ".md")
+        )
+    paths.extend(REPO_ROOT / p for p in ("pyproject.toml", "pixi.lock"))
     # Keep a local contract in run archives without requiring unapproved docs in git.
-    plan = REPO_ROOT / 'docs/plans/subcell-allele-rybg-finetuning.md'
+    plan = REPO_ROOT / "docs/plans/subcell-allele-rybg-finetuning.md"
     if plan.is_file():
         paths.append(plan)
     return sorted(paths)
@@ -84,55 +87,61 @@ def code_fingerprint():
 def capture_source(output):
     """Keep actual source, including uncommitted/untracked implementation, not just HEAD."""
     output = Path(output)
-    path = output / 'source.tar.gz'
+    path = output / "source.tar.gz"
     manifest, digest = {}, hashlib.sha256()
-    with tarfile.open(path, 'x:gz') as archive:
+    with tarfile.open(path, "x:gz") as archive:
         for source in source_files():
             name = str(source.relative_to(REPO_ROOT))
             content = source.read_bytes()
             member = archive.gettarinfo(str(source), arcname=name)
             if not member.isfile():
-                raise ValueError(f'Source must be a regular file: {source}')
+                raise ValueError(f"Source must be a regular file: {source}")
             member.size = len(content)
             archive.addfile(member, io.BytesIO(content))
             manifest[name] = hashlib.sha256(content).hexdigest()
             digest.update(name.encode())
             digest.update(content)
-    save_json(output / 'source.json', {'code_sha256': digest.hexdigest(), 'archive_sha256': sha256(path),
-                                      'files': manifest,
-                                      'git_head': subprocess.check_output(['git', '-C', str(REPO_ROOT), 'rev-parse', 'HEAD'], text=True).strip(),
-                                      'git_status': subprocess.check_output(['git', '-C', str(REPO_ROOT), 'status', '--porcelain'], text=True)})
+    save_json(
+        output / "source.json",
+        {
+            "code_sha256": digest.hexdigest(),
+            "archive_sha256": sha256(path),
+            "files": manifest,
+            "git_head": subprocess.check_output(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], text=True).strip(),
+            "git_status": subprocess.check_output(["git", "-C", str(REPO_ROOT), "status", "--porcelain"], text=True),
+        },
+    )
 
 
 def verify_source(output, expected_code_sha256):
     output = Path(output)
-    receipt = json.loads((output / 'source.json').read_text())
-    archive_path = output / 'source.tar.gz'
-    if sha256(archive_path) != receipt['archive_sha256']:
-        raise ValueError('Source archive checksum mismatch')
+    receipt = json.loads((output / "source.json").read_text())
+    archive_path = output / "source.tar.gz"
+    if sha256(archive_path) != receipt["archive_sha256"]:
+        raise ValueError("Source archive checksum mismatch")
     digest = hashlib.sha256()
     files = {}
-    with tarfile.open(archive_path, 'r:gz') as archive:
+    with tarfile.open(archive_path, "r:gz") as archive:
         for member in archive:
             if not member.isfile():
-                raise ValueError('Unexpected source archive member')
+                raise ValueError("Unexpected source archive member")
             content = archive.extractfile(member).read()
             files[member.name] = hashlib.sha256(content).hexdigest()
             digest.update(member.name.encode())
             digest.update(content)
-    if files != receipt['files'] or digest.hexdigest() != expected_code_sha256:
-        raise ValueError('Archived source does not match the recorded code identity')
+    if files != receipt["files"] or digest.hexdigest() != expected_code_sha256:
+        raise ValueError("Archived source does not match the recorded code identity")
 
 
 def invocation(snapshot=None):
     """Bind a captured source identity, rejecting live source drift when supplied."""
     fingerprint = code_fingerprint()
     if snapshot is not None:
-        captured = json.loads((Path(snapshot) / 'source.json').read_text())['code_sha256']
+        captured = json.loads((Path(snapshot) / "source.json").read_text())["code_sha256"]
         if fingerprint != captured:
-            raise ValueError('Source changed since capture; refusing to publish completion')
+            raise ValueError("Source changed since capture; refusing to publish completion")
         fingerprint = captured
-    return {'argv': sys.argv, 'working_directory': str(Path.cwd()), 'code_sha256': fingerprint}
+    return {"argv": sys.argv, "working_directory": str(Path.cwd()), "code_sha256": fingerprint}
 
 
 # ---------------------------------------------------------------------------
@@ -151,15 +160,12 @@ def get_git_info() -> dict:
     import subprocess
 
     try:
-        commit = (
-            subprocess.run(
-                ["git", "rev-parse", "--short", "HEAD"],
-                capture_output=True,
-                text=True,
-                cwd=REPO_ROOT,
-            )
-            .stdout.strip()
-        )
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        ).stdout.strip()
         dirty = (
             subprocess.run(
                 ["git", "diff", "--quiet"],
@@ -249,7 +255,7 @@ def _make_run_id(script_name: str, timestamp: str) -> str:
     # Strip all non-digit characters, keep first 14 digits (YYYYMMDDHHmmss)
     digits = "".join(c for c in timestamp if c.isdigit())[:14]
     stem = Path(script_name).stem
-    return f"{digits}_{stem}"
+    return f"{digits}_{stem}_{uuid.uuid4().hex}"
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +267,7 @@ def record(
     output_dirs: list[Path],
     input_paths: list[Path] | None = None,
     duration_seconds: float | None = None,
+    stage_id: str | None = None,
 ) -> None:
     """Record provenance for a script run.
 
@@ -276,7 +283,7 @@ def record(
         Wall-clock duration of the run (optional).
     """
     git = get_git_info()
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    now = datetime.now(UTC).isoformat(timespec="seconds")
     argv = sys.argv
     script = argv[0] if argv else "unknown"
 
@@ -290,6 +297,7 @@ def record(
             continue
         sidecar = {
             "schema_version": SCHEMA_VERSION,
+            "stage_id": stage_id,
             "git_commit": git["commit"],
             "git_dirty": git["dirty"],
             "script": rel_path(Path(script)),
@@ -305,7 +313,7 @@ def record(
         sidecar_path.write_text(json.dumps(sidecar, indent=2) + "\n")
 
     # --- Central log ---
-    run_id = _make_run_id(script, now)
+    run_id = stage_id or _make_run_id(script, now)
     entry: dict = {
         "id": run_id,
         "script": rel_path(Path(script)),
