@@ -80,6 +80,28 @@ class CellCropPreparationChecks(unittest.TestCase):
                             cell_crops.extract(release, output)
                         with self.assertRaisesRegex(ValueError, 'mirror'):
                             cell_crops.extract(release, release / 'forbidden')
+                        source = root / 'editable-source'
+                        source.mkdir()
+                        for name in ('pixi.lock', 'pyproject.toml'):
+                            (source / name).write_text('before')
+                        record = cell_crops.record
+
+                        def record_then_edit(*args, **kwargs):
+                            record(*args, **kwargs)
+                            (source / 'pixi.lock').write_text('after')
+
+                        changed = root / 'changed-source'
+                        with patch.object(provenance, 'REPO_ROOT', source), patch.object(
+                                provenance.subprocess, 'check_output', return_value='fixture'), patch.object(
+                                cell_crops, 'record', side_effect=record_then_edit):
+                            with self.assertRaisesRegex(ValueError, 'Source changed'):
+                                cell_crops.extract(release, changed)
+                        self.assertFalse((changed / 'extraction.json').exists())
+                        (root / 'ledger.json').write_text('invalid json')
+                        failed = root / 'failed-ledger'
+                        with self.assertRaises(json.JSONDecodeError):
+                            cell_crops.extract(release, failed)
+                        self.assertFalse((failed / 'extraction.json').exists())
                 self.assertEqual(provenance.sha256(archive_path), digest)
                 self.assertFalse((root / 'outside.npy').exists())
 
