@@ -11,6 +11,7 @@ from unittest.mock import patch
 import polars as pl
 
 from prot_loc_benchmark import provenance, stages
+from prot_loc_benchmark.classification.train import allocated_gpu, select_device, train_and_predict
 from prot_loc_benchmark.downstream_inputs import verify_export
 from prot_loc_benchmark.identity import CELL_ID, identify_cells, ordered_id_hash
 from prot_loc_benchmark.provenance import capture_source, code_fingerprint, save_json, sha256
@@ -99,6 +100,53 @@ class Safeguards(unittest.TestCase):
                 (root / "escape").symlink_to(outside, target_is_directory=True)
                 with self.assertRaisesRegex(ValueError, "escapes"):
                     with stages.stage(root / "escape", [raw], {}):
+                        pass
+
+    def test_explicit_gpu_allocation_and_no_cpu_fallback(self):
+        with patch.dict(os.environ, {"MISLOCUS_CLASSIFIER_BACKEND": "gpu"}, clear=False):
+            for visible in ("", "-1", "0,1"):
+                with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": visible}), self.assertRaises(ValueError):
+                    select_device()
+            with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "GPU-assigned"}):
+                with (
+                    patch("xgboost.build_info", return_value={"USE_CUDA": False}),
+                    self.assertRaisesRegex(ValueError, "CUDA"),
+                ):
+                    select_device()
+                with patch("xgboost.build_info", return_value={"USE_CUDA": True}):
+                    self.assertEqual(select_device(), "cuda:0")
+        with patch.dict(os.environ, {"MISLOCUS_CLASSIFIER_BACKEND": "auto"}):
+            self.assertEqual(select_device(), "cpu")
+        frame = pl.DataFrame({"f": [0.0, 1.0, 2.0, 3.0], "Label": [0, 1, 0, 1]})
+        with patch("prot_loc_benchmark.classification.train.XGBClassifier") as classifier:
+            classifier.return_value.get_booster.return_value.save_config.return_value = json.dumps(
+                {"learner": {"generic_param": {"device": "cpu"}}}
+            )
+            with self.assertRaisesRegex(RuntimeError, "fallback"):
+                train_and_predict(frame, frame, ["f"], device="cuda:0", xgb_params={"n_jobs": 3})
+            self.assertEqual(classifier.call_args.kwargs["n_jobs"], 3)
+
+    def test_gpu_admission_is_exclusive_and_rejects_existing_clients(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory, "CUDA_VISIBLE_DEVICES": "GPU-fixture"}),
+        ):
+
+            def query(args, **kwargs):
+                return "" if "--query-compute-apps=gpu_uuid,pid" in args else "GPU-fixture, H100, driver, 95830 MiB"
+
+            with patch("prot_loc_benchmark.classification.train.subprocess.check_output", side_effect=query):
+                with allocated_gpu("cuda:0"):
+                    with self.assertRaises(BlockingIOError):
+                        with allocated_gpu("cuda:0"):
+                            pass
+                with allocated_gpu("cuda:0"):  # Previous context released the lease.
+                    pass
+            with patch(
+                "prot_loc_benchmark.classification.train.subprocess.check_output", return_value="GPU-fixture, 123"
+            ):
+                with self.assertRaisesRegex(RuntimeError, "compute clients"):
+                    with allocated_gpu("cuda:0"):
                         pass
 
     def test_unbounded_production_is_rejected_before_data_work(self):

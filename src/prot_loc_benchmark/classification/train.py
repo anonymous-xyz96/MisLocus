@@ -1,13 +1,15 @@
-"""XGBoost training, prediction, and device selection."""
+"""XGBoost training with explicit device allocation and no silent CPU fallback."""
 
-from __future__ import annotations
-
+import json
 import logging
 import os
 import subprocess
+from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 import polars as pl
+import xgboost
 from xgboost import XGBClassifier
 
 from prot_loc_benchmark.config import XGBOOST_PARAMS
@@ -15,107 +17,57 @@ from prot_loc_benchmark.config import XGBOOST_PARAMS
 logger = logging.getLogger(__name__)
 
 
-def _count_gpus() -> int:
-    """Count available NVIDIA GPUs via nvidia-smi."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if out.returncode == 0:
-            return len(out.stdout.strip().split("\n"))
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return 0
-
-
-# Optional fallback search paths for NVIDIA CUDA runtime libraries (NVIDIA pip
-# wheels under .../site-packages/nvidia/<sublib>/lib). Set the
-# PROT_LOC_BENCHMARK_CUDA_LIB_PATH environment variable (colon-separated) to
-# add site-specific locations; the gpu pixi env normally provides everything
-# needed without this fallback.
-_CUDA_LIB_SEARCH_PATHS = [
-    p for p in os.environ.get("PROT_LOC_BENCHMARK_CUDA_LIB_PATH", "").split(":") if p
-]
-
-_CUDA_SUBLIBS = [
-    "cuda_runtime", "cublas", "cusolver", "cusparse",
-    "curand", "cufft", "cuda_nvrtc", "nvjitlink",
-]
-
-
-def _ensure_cuda_libs() -> None:
-    """Add NVIDIA CUDA libraries to LD_LIBRARY_PATH if not already present."""
-    current = os.environ.get("LD_LIBRARY_PATH", "")
-    if "nvidia" in current and "cuda_runtime" in current:
-        return  # Already configured
-
-    for base in _CUDA_LIB_SEARCH_PATHS:
-        lib_dirs = []
-        for sublib in _CUDA_SUBLIBS:
-            d = os.path.join(base, sublib, "lib")
-            if os.path.isdir(d):
-                lib_dirs.append(d)
-
-        if lib_dirs:
-            new_path = ":".join(lib_dirs)
-            if current:
-                new_path = f"{new_path}:{current}"
-            os.environ["LD_LIBRARY_PATH"] = new_path
-            logger.info("Added %d CUDA lib dirs from %s", len(lib_dirs), base)
-            return
-
-    logger.warning("No CUDA libraries found in known locations")
-
-
 def select_device() -> str:
-    """Select compute device based on environment variable.
+    backend = os.environ.get("MISLOCUS_CLASSIFIER_BACKEND", "cpu").strip().lower()
+    if backend in ("cpu", "auto"):
+        return "cpu"  # Auto never discovers/allocates somebody else's GPU.
+    if backend != "gpu":
+        raise ValueError(f"Unknown classifier backend: {backend}")
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible or visible == "-1" or "," in visible:
+        raise ValueError("GPU execution requires exactly one explicit CUDA_VISIBLE_DEVICES allocation")
+    if not xgboost.build_info().get("USE_CUDA", False):
+        raise ValueError("Installed XGBoost has no CUDA support; use the locked gpu environment")
+    return "cuda:0"  # Logical index within the one-device allocation, never physical discovery.
 
-    Reads ``MISLOCUS_CLASSIFIER_BACKEND``:
-    - "cpu" → "cpu"
-    - "gpu" → pick first available GPU (falls back to CPU)
-    - "auto" (default) → GPU if available, else CPU
 
-    Returns "cpu" or "cuda:N".
+def gpu_identity():
+    return subprocess.check_output(
+        [
+            "nvidia-smi",
+            "--id=" + os.environ["CUDA_VISIBLE_DEVICES"],
+            "--query-gpu=uuid,name,driver_version,memory.total",
+            "--format=csv,noheader",
+        ],
+        text=True,
+        timeout=10,
+    ).strip()
+
+
+@contextmanager
+def allocated_gpu(device):
+    """Reserve one GPU among these runners; refuse other active compute clients.
+
+    This is an advisory per-user lease, not a reservation against external schedulers.
     """
-    backend = os.environ.get("MISLOCUS_CLASSIFIER_BACKEND", "auto").strip().lower()
+    if device == "cpu":
+        yield None
+        return
+    import fcntl
 
-    if backend == "cpu":
-        return "cpu"
-
-    n_gpus = _count_gpus()
-    if n_gpus == 0:
-        if backend == "gpu":
-            logger.warning("GPU requested but no CUDA devices found, falling back to CPU")
-        return "cpu"
-
-    # Ensure CUDA runtime libraries are on LD_LIBRARY_PATH
-    _ensure_cuda_libs()
-
-    # Try CuPy for smart GPU selection (least memory usage)
-    try:
-        import cupy as cp
-
-        best_gpu = 0
-        min_used = float("inf")
-        for i in range(n_gpus):
-            mem_free, mem_total = cp.cuda.Device(i).mem_info
-            mem_used = mem_total - mem_free
-            if mem_used < min_used:
-                min_used = mem_used
-                best_gpu = i
-
-        device = f"cuda:{best_gpu}"
-    except ImportError:
-        device = "cuda:0"
-    except Exception:
-        logger.warning("CuPy GPU detection failed, defaulting to cuda:0", exc_info=True)
-        device = "cuda:0"
-
-    logger.info("Selected GPU device: %s (%d GPUs available)", device, n_gpus)
-    return device
+    gpu = gpu_identity()
+    uuid = gpu.split(",", 1)[0].strip()
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    if runtime.stat().st_uid != os.getuid() or runtime.stat().st_mode & 0o077:
+        raise ValueError("GPU leases require the private user XDG_RUNTIME_DIR")
+    with (runtime / f"mislocus-{uuid}.lock").open("a") as lease:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        clients = subprocess.check_output(
+            ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"], text=True, timeout=10
+        )
+        if any(line.split(",", 1)[0].strip() == uuid for line in clients.splitlines()):
+            raise RuntimeError(f"Allocated GPU {uuid} already has compute clients; retry admission later")
+        yield gpu
 
 
 def train_and_predict(
@@ -125,42 +77,44 @@ def train_and_predict(
     label_col: str = "Label",
     device: str = "cpu",
     xgb_params: dict | None = None,
+    model_path=None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]] | None:
-    """Train XGBoost and return test predictions.
-
-    Returns (predictions, true_labels, feature_importances) or None if
-    the training data has extreme class imbalance (>100:1).
-    """
     params = {**XGBOOST_PARAMS, **(xgb_params or {})}
-
     train_labels = train_df[label_col].to_numpy()
     n_pos = int((train_labels == 1).sum())
     n_neg = int((train_labels == 0).sum())
-
     if n_pos == 0 or n_neg == 0:
         logger.warning("Single-class training data, skipping")
         return None
-
     imbalance = max(n_pos, n_neg) / min(n_pos, n_neg)
     if imbalance > 100:
         logger.warning("Extreme class imbalance %.0f:1, skipping", imbalance)
         return None
-
     params["scale_pos_weight"] = n_neg / n_pos
-
-    if device != "cpu":
-        params["device"] = device
-        params.pop("n_jobs", None)
-
+    params["device"] = device
+    # n_jobs bounds host-side work even when tree construction runs on a GPU.
+    params.setdefault("n_jobs", 1)
+    params.setdefault("random_state", 0)
     X_train = train_df.select(feature_cols).to_numpy().astype(np.float32)
     X_test = test_df.select(feature_cols).to_numpy().astype(np.float32)
-    y_train = train_labels
-    y_test = test_df[label_col].to_numpy()
-
     clf = XGBClassifier(**params)
-    clf.fit(X_train, y_train)
+    clf.fit(X_train, train_labels)
+    actual_device = json.loads(clf.get_booster().save_config())["learner"]["generic_param"]["device"]
+    if actual_device != device:
+        raise RuntimeError(f"XGBoost device fallback: requested {device}, used {actual_device}")
+    if model_path is not None:
+        from prot_loc_benchmark.identity import ordered_id_hash
 
-    preds = clf.predict_proba(X_test)[:, 1]
-    importances = dict(zip(feature_cols, clf.feature_importances_.tolist()))
-
-    return preds, y_test, importances
+        clf.get_booster().set_attr(
+            feature_columns=json.dumps(feature_cols),
+            ordered_training_cell_ids_sha256=ordered_id_hash(train_df),
+            ordered_test_cell_ids_sha256=ordered_id_hash(test_df),
+            positive_label="reference",
+        )
+        clf.save_model(model_path)
+    if device == "cpu":
+        preds = clf.predict_proba(X_test)[:, 1]
+    else:
+        # Explicit host-to-device DMatrix path; avoids sklearn's implicit device-mismatch fallback.
+        preds = clf.get_booster().predict(xgboost.DMatrix(X_test, nthread=params["n_jobs"]))
+    return preds, test_df[label_col].to_numpy(), dict(zip(feature_cols, clf.feature_importances_.tolist()))
