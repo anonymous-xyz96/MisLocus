@@ -39,6 +39,8 @@ BENCHMARK_DIR = PROCESSED_DIR / "benchmark"
 # Crop / manifest inputs (shipped in the dataset bundle)
 CROP_MANIFEST_DIR = INTERIM_DIR / "crop_manifest"
 SINGLE_CELL_CROPS_DIR = INTERIM_DIR / "single_cell_crops"
+# Raw release filenames, NOT a model's input-channel ordering.
+CELL_CROP_CHANNEL_FILES = ("agp.npy", "dna.npy", "gfp.npy", "mito.npy")
 
 # ============================================================================
 # BATCH CONFIGURATION
