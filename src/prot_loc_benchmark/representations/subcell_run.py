@@ -45,6 +45,13 @@ class AlleleCheckpoint(ModelCheckpoint):
                          mode='max', save_top_k=1, save_last=True, enable_version_counter=False,
                          save_on_train_epoch_end=False)
 
+    def on_validation_end(self, trainer, pl_module):
+        super().on_validation_end(trainer, pl_module)
+        # Lightning 2.6.1 otherwise advances last only when top-k improves.
+        # Persist current optimizer/RNG/patience even on ties or regressions.
+        if not self._should_skip_saving_checkpoint(trainer):
+            self._save_last_checkpoint(trainer, self._monitor_candidates(trainer))
+
     def _save_checkpoint(self, trainer, filepath):
         super()._save_checkpoint(trainer, filepath)
         if trainer.is_global_zero and filepath == self.best_model_path:
