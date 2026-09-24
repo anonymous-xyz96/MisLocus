@@ -36,9 +36,13 @@ def compute_plate_stats(lf: pl.LazyFrame) -> pl.DataFrame:
     cols = lf.collect_schema().names()
     feat_cols = _find_feat_cols(cols)
 
+    if not feat_cols:
+        raise ValueError("No features remain for plate statistics")
     # Collect to pandas for reliable grouped MAD via scipy
     select_cols = feat_cols + ["Metadata_Plate"]
     pdf = lf.select(pl.col(select_cols)).collect().to_pandas()
+    if pdf.empty:
+        raise ValueError("No cells remain for plate statistics")
 
     mad_fn = partial(median_abs_deviation, nan_policy="omit", axis=0)
     grouped = pdf.groupby("Metadata_Plate", observed=True)
@@ -72,9 +76,7 @@ def compute_plate_stats(lf: pl.LazyFrame) -> pl.DataFrame:
         values="value",
     )
     stats.reset_index(inplace=True)
-    stats["abs_coef_var"] = (
-        (stats["mad"] / stats["median"]).fillna(0).abs().replace(np.inf, 0)
-    )
+    stats["abs_coef_var"] = (stats["mad"] / stats["median"]).fillna(0).abs().replace(np.inf, 0)
     stats = stats.astype(
         {
             "min": np.float32,
@@ -110,19 +112,27 @@ def select_variant_features(
     cols = lf.collect_schema().names()
     meta_cols = _find_meta_cols(cols)
 
+    features = _find_feat_cols(cols)
+    plates = lf.select("Metadata_Plate").unique().collect()
+    expected = plates.join(pl.DataFrame({"feature": features}, schema={"feature": pl.String}), how="cross")
+    keys = plate_stats.select("Metadata_Plate", pl.col("feature").cast(pl.String))
+    if (
+        keys.unique().height != keys.height
+        or not expected.join(keys, on=["Metadata_Plate", "feature"], how="anti").is_empty()
+    ):
+        raise ValueError("Missing or duplicate plate-feature statistics")
+    stats = plate_stats.filter(pl.col("Metadata_Plate").is_in(plates["Metadata_Plate"].to_list()))
     # Filter stats to features with MAD≠0 and abs_coef_var > threshold
-    passing = plate_stats.filter(
-        (pl.col("mad") != 0) & (pl.col("abs_coef_var") > acv_threshold)
+    passing = stats.filter((pl.col("mad") != 0) & (pl.col("abs_coef_var") > acv_threshold))
+
+    # Count against ALL input plates, including plates where nothing passed.
+    variant_features = sorted(
+        passing.group_by("feature")
+        .agg(pl.col("Metadata_Plate").n_unique().alias("n_plates"))
+        .filter(pl.col("n_plates") == plates.height)["feature"]
+        .to_list()
     )
-
-    # Take intersection across all plates
-    per_plate = passing.group_by("Metadata_Plate").agg(pl.col("feature"))
-    feature_sets = [set(row) for row in per_plate["feature"].to_list()]
-    if not feature_sets:
-        logger.warning("No variant features found — returning empty frame")
-        return lf.select(pl.col(meta_cols))
-
-    variant_features = sorted(set.intersection(*feature_sets))
+    variant_features = [f for f in variant_features if f in features]
 
     n_total = len(_find_feat_cols(cols))
     logger.info(
@@ -130,7 +140,7 @@ def select_variant_features(
         n_total,
         len(variant_features),
         acv_threshold,
-        len(feature_sets),
+        plates.height,
     )
 
     return lf.select(pl.col(meta_cols + variant_features))
@@ -172,20 +182,41 @@ def robustmad(
     feat_cols = _find_feat_cols(cols)
     meta_cols = _find_meta_cols(cols)
 
+    if not feat_cols:
+        raise ValueError("No features remain for normalization")
+    df = lf.collect()
+    if df.is_empty() or df["Metadata_Plate"].null_count():
+        raise ValueError("Normalization requires cells with non-null plate identities")
+    plates = df["Metadata_Plate"].unique(maintain_order=True).to_list()
+    required = {"Metadata_Plate", "feature", "median", "mad"}
+    if required - set(plate_stats.columns):
+        raise ValueError("Normalization statistics require plate, feature, median and mad")
+    stats = plate_stats.filter(pl.col("Metadata_Plate").is_in(plates) & pl.col("feature").is_in(feat_cols))
+    # Extra features are expected after CP feature selection, but every requested
+    # plate-feature combination must have exactly one valid fitted statistic.
+    if (
+        stats.height != len(plates) * len(feat_cols)
+        or stats.select("Metadata_Plate", "feature").unique().height != stats.height
+    ):
+        raise ValueError("Missing or duplicate normalization statistics for input plates/features")
+    if not stats.select(
+        (pl.col("median").is_finite() & pl.col("mad").is_finite() & (pl.col("mad") >= 0)).fill_null(False).all()
+    ).item():
+        raise ValueError("Normalization statistics must have finite medians and nonnegative finite MADs")
+
     # Pivot stats to get per-plate median and MAD as dicts
-    medians_df = plate_stats.filter(pl.col("feature").is_in(feat_cols)).pivot(
+    medians_df = stats.pivot(
         index="Metadata_Plate",
         on="feature",
         values="median",
     )
-    mads_df = plate_stats.filter(pl.col("feature").is_in(feat_cols)).pivot(
+    mads_df = stats.pivot(
         index="Metadata_Plate",
         on="feature",
         values="mad",
     )
 
     # Build lookup: plate → {feature: median}, plate → {feature: mad}
-    plates = medians_df["Metadata_Plate"].to_list()
     median_lookup = {}
     mad_lookup = {}
     for plate in plates:
@@ -194,14 +225,14 @@ def robustmad(
         median_lookup[plate] = row_med.row(0, named=True)
         mad_lookup[plate] = row_mad.row(0, named=True)
 
-    # Collect, normalize per plate, recombine
-    df = lf.collect()
+    # Normalize each input plate independently, then restore the original row order.
     normalized_parts = []
+    row_indices = []
 
     for plate in plates:
-        plate_df = df.filter(pl.col("Metadata_Plate") == plate)
-        if plate_df.height == 0:
-            continue
+        mask = df["Metadata_Plate"] == plate
+        plate_df = df.filter(mask)
+        row_indices.append(mask.arg_true())
 
         med_vals = median_lookup[plate]
         mad_vals = mad_lookup[plate]
@@ -209,20 +240,20 @@ def robustmad(
         # Build expressions: (col - median) / mad for each feature
         norm_exprs = []
         for f in feat_cols:
-            med = med_vals.get(f)
-            mad = mad_vals.get(f)
-            if med is not None and mad is not None and mad != 0:
-                norm_exprs.append(
-                    ((pl.col(f) - med) / mad).cast(pl.Float32).alias(f)
-                )
+            med = med_vals[f]
+            mad = mad_vals[f]
+            if mad != 0:
+                norm_exprs.append(((pl.col(f) - med) / mad).cast(pl.Float32).alias(f))
             else:
-                # MAD=0 → keep original (shouldn't happen after variant selection)
+                # Preserve the reference zero-MAD policy, including sparse embeddings.
                 norm_exprs.append(pl.col(f).cast(pl.Float32))
 
         plate_norm = plate_df.select([pl.col(c) for c in meta_cols] + norm_exprs)
         normalized_parts.append(plate_norm)
 
-    result = pl.concat(normalized_parts)
+    result = pl.concat(normalized_parts)[pl.concat(row_indices).arg_sort()]
+    if not result.select(pl.all_horizontal(pl.col(feat_cols).is_finite().fill_null(False)).all()).item():
+        raise ValueError("Normalization produced nonfinite features; inspect input values and statistics")
     logger.info(
         "RobustMAD normalization: %d cells across %d plates",
         result.height,
