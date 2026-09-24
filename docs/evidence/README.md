@@ -36,7 +36,7 @@ cd "$WEIGHTS_ROOT"
 sha256sum --check "$CODE/docs/evidence/subcell-v2-frozen-weights.sha256"
 ```
 
-The [current review follow-up](../reviews/subcell-v2-readiness-followup.md) records
+The [checkpoint/frozen follow-up](../reviews/subcell-v2-readiness-followup.md) records
 27 passing CPU tests, exact tiny-model resume checks, the corrected plateau recovery
 bug, and the CI-publication permission limitation. Repeated frozen GPU pilots matched
 exactly for288 cells/model; this is a bounded check, not universal reproducibility.
@@ -47,6 +47,10 @@ record, not a rewritten receipt or a guarantee of filesystem immutability.
 Matched **raw** controls now exist; matched downstream processing, scientific
 comparisons, public artifact distribution and manuscript synchronization remain
 separate work. The original training/adapted artifacts were not regenerated.
+
+The later [review-stack provenance corrections](../reviews/subcell-v2-provenance-corrections.md)
+cover source/receipt consistency and completion ordering, with a separate read-only
+historical audit. They do not change the producer attribution of these artifacts.
 
 ## Original training/adapted package: unchanged snapshot
 
@@ -119,9 +123,10 @@ Original source archives and the approved contract remain authoritative for old 
 
 ## What this does not establish
 
-- No independent parallel reviewer was available; this is direct source/artifact
-  review, not independent certification. The [two-axis report](../reviews/subcell-v2-merge-review.md)
-  records its scope and merge risks.
+- No independent parallel reviewer was available for the original artifact review.
+  Later scoped AI reviews are recorded in the correction note above; neither is
+  independent scientific certification. The [original report](../reviews/subcell-v2-merge-review.md)
+  retains its historical scope and merge risks.
 - Same-run rank RNG correlation has **not** been removed; its scientific effect is
   unmeasured. Historical missing determinism flags have not been reconstructed.
 - Seed42-only exported/downstream results do not demonstrate multi-seed robustness.
