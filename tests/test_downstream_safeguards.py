@@ -3,6 +3,8 @@
 import importlib.util
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -13,9 +15,11 @@ from unittest.mock import patch
 
 import numpy as np
 import polars as pl
+from copairs.matching import UnpairedException
 
 from prot_loc_benchmark import provenance, stages
 from prot_loc_benchmark.classification.train import allocated_gpu, select_device, train_and_predict
+from prot_loc_benchmark.config import REPO_ROOT
 from prot_loc_benchmark.copairs_runtime import bounded_copairs
 from prot_loc_benchmark.downstream_inputs import verify_export
 from prot_loc_benchmark.identity import CELL_ID, identify_cells, ordered_id_hash
@@ -230,6 +234,158 @@ class Safeguards(unittest.TestCase):
                         )
                     )
             np.testing.assert_array_equal(*arrays)
+
+    def test_copairs_reference_parity_membership_and_missing_negative_support(self):
+        current = load_script(REPO_ROOT / "scripts/09c_classify_PA.py", "pa_current")
+        reference_path = REPO_ROOT.parent / "prot-loc-publish-readiness-reference/scripts/09c_classify_PA.py"
+        if not reference_path.exists():
+            self.skipTest("Pinned read-only publication checkout is required for parity check")
+        reference = load_script(reference_path, "pa_reference")
+        rng = np.random.default_rng(72)
+        rows = [
+            dict(
+                Metadata_Plate=f"P_T{t}",
+                Metadata_Well=well,
+                Metadata_ImageNumber=site,
+                Metadata_ObjectNumber=cell,
+                Metadata_CellID=f"{t}:{well}:{site}:{cell}",
+                Metadata_gene_allele=allele,
+                Metadata_symbol="G",
+                Metadata_node_type=node,
+                Metadata_Control="Exp",
+                f=float(rng.normal()),
+                g=float(rng.normal()),
+            )
+            for t in range(1, 5)
+            for allele, well, node in [("G", "A01", "disease_wt"), ("G_v", "B01", "allele")]
+            for site in (1, 2)
+            for cell in range(3)
+        ]
+        frame = identify_cells(pl.DataFrame(rows), "fixture")
+        kwargs = dict(
+            alleles=["G_v"],
+            feat_cols=["f", "g"],
+            cells_per_site=20,
+            neg_per_plate=0,
+            sample_level="site",
+            aggregate=True,
+            null_size=32,
+            threshold=0.05,
+            seed=42,
+            max_workers=1,
+            test_split="t4",
+        )
+        with tempfile.TemporaryDirectory() as directory, bounded_copairs(1):
+            root = Path(directory)
+            # The original library's default home cache must never be touched by a test.
+            with patch("copairs.compute.Path.home", return_value=root / "reference-home"):
+                expected = reference._compute_map_vs_ref(frame, **kwargs)
+            current._TRACE_DIR = root / "trace"
+            actual = current._compute_map_vs_ref(frame.reverse(), **kwargs)
+            self.assertEqual(actual.to_dicts(), expected.to_dicts())
+            members = pl.read_parquet(root / "trace/00000/members.parquet")
+            self.assertEqual(set(members[CELL_ID]), set(frame[CELL_ID]))
+            queries = pl.read_parquet(root / "trace/00000/queries.parquet")
+            self.assertTrue(queries["Metadata_Plate"].str.ends_with("T4").all())
+            self.assertTrue((queries["n_total_pairs"] > queries["n_pos_pairs"]).all())
+            broken = frame.filter(
+                ~((pl.col("Metadata_Plate") == "P_T4") & (pl.col("Metadata_node_type") == "disease_wt"))
+            )
+            with patch.object(current, "average_precision", side_effect=AssertionError("No eligible queries")):
+                skipped = current._compute_map_vs_ref(broken, **kwargs)
+            self.assertTrue(skipped.is_empty())
+            trace = root / "trace/00001"
+            self.assertEqual(
+                json.loads((trace / "status.json").read_text()),
+                {"status": "not_estimable", "reason": "missing_same_plate_reference"},
+            )
+            excluded = pl.read_parquet(trace / "excluded_queries.parquet")
+            self.assertEqual(excluded.height, 2)
+            self.assertEqual(set(excluded["Metadata_gene_allele"]), {"G_v"})
+            self.assertEqual(set(excluded["Metadata_Plate"]), {"P_T4"})
+            self.assertEqual(set(excluded["exclusion_reason"]), {"missing_same_plate_reference"})
+            self.assertTrue(pl.read_parquet(trace / "queries.parquet").is_empty())
+            # Other plates of this allele remain eligible in all-query mode.
+            actual = current._compute_map_vs_ref(broken, **{**kwargs, "test_split": None})
+            self.assertEqual(actual["Metadata_gene_allele"].to_list(), ["G_v"])
+            trace = root / "trace/00002"
+            queries = pl.read_parquet(trace / "queries.parquet")
+            self.assertEqual(set(queries["Metadata_Plate"]), {"P_T1", "P_T2", "P_T3"})
+            # Unsupported queries still serve as positives: the pool is unchanged.
+            self.assertEqual(set(queries["n_pos_pairs"]), {6})
+            self.assertEqual(pl.read_parquet(trace / "profiles.parquet").height, 14)
+            # Missing positive partners are still a hard failure, not another skip.
+            no_positives = frame.filter(pl.col("Metadata_Plate") == "P_T4")
+            with self.assertRaisesRegex(UnpairedException, "positive pairs"):
+                current._compute_map_vs_ref(no_positives, **kwargs)
+            self.assertFalse((root / "trace/00003/status.json").exists())
+            # A missing reference for G must not remove supported H queries.
+            supported = frame.with_columns(
+                pl.lit("H").alias("Metadata_symbol"),
+                pl.col("Metadata_gene_allele").str.replace("G", "H"),
+                pl.col("Metadata_Plate").str.replace("P", "Q"),
+                (pl.col(CELL_ID) + ":H").alias(CELL_ID),
+            )
+            mixed = current._compute_map_vs_ref(pl.concat([broken, supported]), **{**kwargs, "alleles": ["G_v", "H_v"]})
+            self.assertEqual(mixed["Metadata_gene_allele"].to_list(), ["H_v"])
+            self.assertEqual(
+                mixed.drop("Metadata_gene_allele").to_dicts(), expected.drop("Metadata_gene_allele").to_dicts()
+            )
+            trace = root / "trace/00004"
+            self.assertEqual(json.loads((trace / "status.json").read_text())["status"], "complete")
+            self.assertEqual(pl.read_parquet(trace / "excluded_queries.parquet").height, 2)
+
+    def test_missing_copairs_controls_cannot_publish_a_completed_stage(self):
+        rng = np.random.default_rng(14)
+        batch, rep = "2024_01_23_Batch_7", "vit"
+        rows = [
+            dict(
+                Metadata_Plate=f"P_T{t}",
+                Metadata_Well=well,
+                Metadata_ImageNumber=site,
+                Metadata_ObjectNumber=cell,
+                Metadata_CellID=f"{t}:{well}:{site}:{cell}",
+                Metadata_plate_map_name="P",
+                Metadata_gene_allele=allele,
+                Metadata_symbol="G",
+                f=float(rng.normal()),
+                g=float(rng.normal()),
+            )
+            for t in range(1, 5)
+            for allele, well in [("G", "A01"), ("G_v", "B01")]
+            for site in (1, 2)
+            for cell in range(15)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "interim" / rep / batch
+            inputs.mkdir(parents=True)
+            pl.DataFrame(rows).write_parquet(inputs / "embeddings.parquet")
+            env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "MISLOCUS_DATA_ROOT": str(root)}
+            commands = [
+                ("06_preprocess_profiles.py", []),
+                ("09c_classify_PA.py", ["--test-split", "t4", "--null-size", "32", "--ctrl-null-size", "32"]),
+            ]
+            for script, flags in commands:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO_ROOT / "scripts" / script),
+                        "--batch",
+                        batch,
+                        "--representation",
+                        rep,
+                        *flags,
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode == 0, script.startswith("06"), result.stdout + result.stderr)
+            output = root / "processed/classification_PA" / f"{rep}_t4" / batch
+            self.assertFalse((output / "stage.json").exists())
+            self.assertTrue((output / "failed.json").exists())
 
     def test_verified_export_contract_rejects_partial_wrong_checkpoint_and_tampering(self):
         # A small producer-shaped fixture, not a trusted substitute for production verification.
