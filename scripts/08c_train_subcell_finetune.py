@@ -97,6 +97,7 @@ def main():
         save_json(output / 'class_index.json', classes)
         save_json(output / 'validation_ids.json', validation)
         capture_source(output)
+        verify_source(output, identity['code_sha256'])
     model = SubCellAlleleModule(get_model_dict(model_config(config['family'])),
                                sorted(classes), identity, output)
     if args.resume is None:

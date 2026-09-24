@@ -103,6 +103,24 @@ class ProvenanceChecks(unittest.TestCase):
                     main(frozen=frozen)
             self.assertEqual(failure.exception.code, 2)
 
+    def test_preflight_output_cannot_enter_either_input_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, crops = root / 'release', root / 'crops'
+            release.mkdir()
+            crops.mkdir()
+            for protected in (release, crops):
+                alias = root / (protected.name + '-alias')
+                alias.symlink_to(protected, target_is_directory=True)
+                for output in (protected, protected / 'nested/cohort', alias / 'cohort'):
+                    with self.subTest(output=output), patch(
+                            'prot_loc_benchmark.representations.subcell_manifest.release_inventory') as inventory:
+                        before = set(root.rglob('*'))
+                        with self.assertRaisesRegex(ValueError, 'Preflight must not write'):
+                            build_manifest(release, crops, output)
+                        inventory.assert_not_called()
+                        self.assertEqual(set(root.rglob('*')), before)
+
     def test_separate_extraction_preflight_and_tamper_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

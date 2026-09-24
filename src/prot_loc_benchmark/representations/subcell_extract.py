@@ -141,7 +141,7 @@ def main(*, frozen=False):
     binding['input_sha256'] = {str(p.resolve()): sha256(p) for p in inputs}
     args.output.mkdir(parents=True, exist_ok=False)
     capture_source(args.output)
-    binding.update(invocation=invocation(), runtime=runtime_info(),
+    binding.update(invocation=invocation(args.output), runtime=runtime_info(),
                    source_archive_sha256=sha256(args.output / 'source.tar.gz'))
     preprocess = SubCellPreprocessor()
     outputs, constant_cells = {}, []
