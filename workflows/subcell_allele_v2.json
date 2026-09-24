@@ -9,7 +9,8 @@
   "storage_location": "External ARTIFACT_ROOT; never inside the frozen Hugging Face mirror",
   "completion_evidence": "docs/evidence/subcell-v2-completion.json",
   "verification_instructions": "docs/evidence/README.md",
-  "review": "docs/reviews/subcell-v2-merge-review.md",
+  "review": "docs/reviews/subcell-v2-readiness-followup.md",
+  "historical_review": "docs/reviews/subcell-v2-merge-review.md",
   "shared_crop_preparation": {
     "script": "scripts/01_prepare_cell_crops.py",
     "model_dependencies": false,
@@ -63,11 +64,38 @@
     "pilot_cells_per_model": 288,
     "pilot_repeat_max_abs_error": 0.0
   },
+  "matched_frozen_extraction": {
+    "status": "complete_verified",
+    "families": ["mae", "vit"],
+    "representations": ["subcell_frozen_rybg_v2_mae", "subcell_frozen_rybg_v2_vit"],
+    "split": "all",
+    "cells_per_model": 3332309,
+    "features": 1536,
+    "dtype": "float32",
+    "source_commit": "d0c61f03eab6f153de2360406e7f0b81a9b59285",
+    "code_sha256": "1f2a7f171219b773f33c4d58983063b1db3d021bcfa7336e21a0724c2a90b64e",
+    "export_directory_relative_to_artifact_root": "mislocus-derived/cf70fbaedf64874907730f8b8db3a62d79149164/exports/subcell-frozen-all-20260924-v1",
+    "control_directory": "jobs/extraction-frozen-all-20260924-v1",
+    "completion_evidence": "docs/evidence/subcell-v2-frozen-completion.json",
+    "consumer_gate": "Complete receipt, full finite-FP32 readback, exact ordered metadata matching to adapted export and file hashes",
+    "pilot_cells_per_model": 288,
+    "pilot_repeat_max_abs_error": 0.0,
+    "downstream_results_certified": false
+  },
+  "checkpoint_recovery": {
+    "fix_commit": "d0c61f03eab6f153de2360406e7f0b81a9b59285",
+    "latest_state_saved_on_non_improving_validation": true,
+    "native_best_and_tie_selection_unchanged": true,
+    "plateau_resume_and_terminal_interruption_regression_passed": true,
+    "clean_cpu_tests_passed": 27,
+    "original_training_artifacts_rewritten": false
+  },
   "remaining": {
     "within_run_rank_rng_correlation": "Retained; performance impact unmeasured; independent rank streams need a new approved run protocol",
     "single_seed_reporting": "No downstream multi-seed robustness or ensemble claim",
     "historical_determinism_flags": "Not fully recorded; future logging does not reconstruct them",
-    "matched_frozen_four_channel_bulk_exports": "Pending before adaptation-only comparisons",
+    "matched_downstream_processing": "Required before adaptation-only comparisons; raw matched controls are now complete",
+    "github_ci": "Prepared workflow publication blocked by missing workflow scope; no passing CI checks claimed",
     "downstream_analyses": "Separate workstream; not certified by this completion record",
     "manuscript_synchronization": "Separate repository/workstream",
     "public_artifact_distribution": "Not performed; hashes are not downloads"

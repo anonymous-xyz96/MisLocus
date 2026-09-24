@@ -266,6 +266,13 @@ Other models use the same raw arrays with their own preparation. Do not run the
 older download/remap command against the shared mirror; its remapped output is
 not the immutable git/LFS input required by01.
 
+Both adapted seed42 exports and their matched frozen four-channel MAE/ViT raw
+controls are complete in separate external storage. All four have the same
+3,332,309 canonical cells and metadata; they are **not** additional downloads in
+this historical HF bundle. See the [evidence inventories](evidence/README.md).
+Matching raw inputs does not replace the separate downstream preprocessing and
+evaluation-policy checks.
+
 ## Reproducibility
 
 - The legacy downloader's `--hf-repo` is a repository ID, not a revision argument;

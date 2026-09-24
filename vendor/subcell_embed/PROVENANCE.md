@@ -44,10 +44,12 @@ omegaconf and scipy.
 
 ## Execution scope
 
-Completed allele-v2 training used companion commit `03b1961`; seed42 extraction
-used `e306037`. Their immutable source archives are authoritative, not this later
-documentation revision. See [protocol and limitations](../../docs/subcell_allele_v2.md)
-and [completion evidence](../../docs/evidence/README.md).
+Completed allele-v2 training used companion commit `03b1961`; seed42 adapted
+extraction used `e306037`; the completed matched frozen four-channel exports used
+`d0c61f0`. The latter fixes checkpoint recovery on non-improving validation, not
+model mathematics, input preprocessing or the six original fits. Their immutable
+source archives are authoritative, not this later documentation revision. See
+[protocol and limitations](../../docs/subcell_allele_v2.md) and [completion evidence](../../docs/evidence/README.md).
 
 The local loop retains same-run cross-rank RNG correlation. Different run seeds
 are not identical experiments, but no claim of independent per-rank streams or

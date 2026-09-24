@@ -25,13 +25,18 @@ No model was retrained or its historical source/receipts rewritten during harden
 These are **allele-identification selection metrics**, not mislocalization accuracy,
 downstream retrieval mAP, or unseen-allele performance. Seeds43/44 checkpoints are
 archived, not exported in the completed seed42 campaign. Matched frozen four-channel
-controls have loading/parity evidence but **no completed new bulk exports** here.
+MAE and ViT controls subsequently completed on 2026-09-24: **3,332,309 cells each**,
+all six batches/T1–T4, with full finite-FP32 readback and identical ordered metadata.
+Their producer source is `d0c61f0`; the earlier adapted exports remain attributed to
+`e306037` and training to `03b1961`. No retraining or adapted re-extraction occurred.
 No downstream analysis results or manuscript synchronization are claimed complete.
 
-See the [completion evidence](evidence/subcell-v2-completion.json),
-[verification instructions](evidence/README.md), and
-[two-axis review](reviews/subcell-v2-merge-review.md). The original approved planning
-contract is retained unchanged in the external artifact archive under SHA256
+See the original [training/adapted evidence](evidence/subcell-v2-completion.json),
+[matched frozen evidence](evidence/subcell-v2-frozen-completion.json),
+[verification instructions](evidence/README.md), and current
+[two-axis follow-up](reviews/subcell-v2-readiness-followup.md). The earlier
+[review](reviews/subcell-v2-merge-review.md) remains an unchanged historical snapshot.
+The original approved planning contract is retained unchanged in the external artifact archive under SHA256
 `1ae7ad94fb06b3db2ad0b46aed51bcebf5335561b17f3343beba429a157c67fe`.
 The operational specification below reconciles that contract with actual execution;
 it does not rewrite the original prospective methods as evidence of completed analyses.
@@ -119,10 +124,12 @@ it does not rewrite the original prospective methods as evidence of completed an
    or establish exact upstream deterministic-cuDNN parity. No backend behavior was
    retrospectively changed. Matching GPU pilots were exactly repeatable for288 cells
    per model; this is not universal bitwise reproducibility.
-4. **Matched frozen controls remain a comparison gate.** Use four-channel HPA MAE
-   and ViT with identical cohort, geometry, precision and downstream processing.
-   Historical RBG features are not an adaptation-only control. Export/verify those
-   controls before claiming benefit from fine-tuning; no new retraining is needed.
+4. **Matched raw controls are complete; downstream matching remains a gate.** The
+   frozen four-channel MAE/ViT exports have the same cohort, image preprocessing,
+   precision, feature schema and metadata as the adapted exports. Use identical
+   downstream processing before claiming benefit from fine-tuning. Historical RBG
+   features are still not an adaptation-only control. Raw-export completion is not
+   a completed performance comparison.
 5. **Downstream policies are separate.** All-split inference does not authorize T4
    fitting/tuning. Fix evaluator train/test roles, copairs query/context/positive
    rules, normalization/feature-selection populations, zero-MAD and calibration/hit
@@ -160,9 +167,9 @@ losses, clipping, sampled parameter drift, timings and per-rank memory/RNG state
 Hashes bind bytes, not scientific validity or numerical invariance across hardware.
 
 `extraction.json` is published atomically **last**, after all six batches and ledger
-writes succeed. It binds input hashes, selected checkpoint/receipt, crop-rehash
-receipt, source, feature order, ordered IDs and per-batch hashes/counts. File
-existence alone is not success. Pilots write `pilot.json`, never `extraction.json`.
+writes succeed. It binds input hashes, the selected checkpoint/receipt or frozen
+weight hash, crop-rehash receipt, source, feature order, ordered IDs and per-batch
+hashes/counts. File existence alone is not success. Pilots write `pilot.json`, never `extraction.json`.
 The completed campaign additionally performed full readback: finite FP32 features,
 exact ordered IDs/splits, schema, source and hashes; see `verified-production-*.json`
 in its external control directory. Consumers must verify these bindings and write
@@ -172,7 +179,10 @@ The shared ledger is a locked invocation index, not the authority for completion
 Use explicit `--provenance-log` outside inputs/exports; without it the legacy default
 is the code checkout's `data/provenance_log.json`. Routine preflight verifies saved
 hashes and crop size/mtime, not a new407-GiB payload scan; run01 `verify` when a fresh
-content audit is needed. Such a rehash is point-in-time integrity, not a read-only mount.
+content audit is needed. A separate post-frozen-export audit rehashed all17,060 crop
+files /436,847,345,580 bytes successfully. It supplements, rather than rewrites, the
+producer's original input-rehash binding. Such a rehash is point-in-time integrity,
+not a read-only mount.
 
 ## Commands and intentional CLI migration
 
@@ -226,9 +236,14 @@ CUDA_VISIBLE_DEVICES=0,1 pixi run -e subcell torchrun --standalone --nproc_per_n
 Omitting `--fit` validates bindings only. `--smoke-updates 24` requires a separate
 output and yields no selectable checkpoint. Explicit resume names that run's
 `models/last.ckpt`; it requires unchanged source/config/data/runtime/rank count and
-a compatible pass-boundary checkpoint. Completed, horizon-ended or early-stopped
-production runs are rejected. Use the archived original implementation for compatible
-historical interrupted recovery, not a new PR head. Never resume these six finished runs.
+a compatible pass-boundary checkpoint. Since `d0c61f0`, every completed validation
+persists current optimizer/scheduler/RNG/stopping state even if AP ties or decreases;
+`last.ckpt` is no longer left at the last best-AP pass. Native best/tie selection is
+unchanged. Completion markers and saved horizon/early-stop states reject terminal
+production resume, including interruption after the terminal validation save but
+before the completion marker. Unsaved progress cannot be recovered from a process
+killed before checkpoint publication. Use the archived original implementation for
+compatible historical interrupted recovery, not a new PR head. Never resume these six finished runs.
 
 Example selected MAE-s42 export (repeat with ViT's selected checkpoint/output name):
 
@@ -254,10 +269,14 @@ ViT: `$WEIGHTS/vit_supcon_model/encoder.pth`, SHA
 `6a2d117bcacaa0697034d06d6922580ca7cd996564f270529ec97e6502559845`.
 Use names `subcell_frozen_rybg_v2_{mae,vit}` with the same explicit split and provenance flags.
 
-The completed run used an independent installation of the same locked environment
-in a clean detached checkout. Separate worktrees do not isolate resources: that
-campaign capped each extractor at64GiB RAM/4 CPU-equivalents/128 tasks, one GPU per
-model, with15-second supervision and separate logs. Memory-high reclaim occurred;
+The adapted run used an independent installation of the locked environment in a
+clean detached checkout. The later frozen campaign reused that environment without
+mutation, with explicit imports from its own clean detached `d0c61f0` source.
+Separate worktrees do not isolate resources: the adapted campaign capped each extractor at64GiB RAM/4 CPU-equivalents/128 tasks, one GPU per
+model, with15-second supervision and separate logs. The frozen campaign used the
+same worker limits and separately retained its spec, source, controller, pilot/repeat
+and full-readback logs. Its verifier also compared every metadata column against
+the corresponding adapted export. Memory-high reclaim occurred;
 there were no OOMs or hard-limit hits. This is tested containment, not optimal
 throughput or distributed extraction. Reusing a verified environment is possible
 with explicit source imports and no package mutation. Some hosts require
@@ -275,5 +294,10 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS
 `tests/subcell_gather_probe.py` checks distributed gradients;
 `tests/subcell_frozen_parity.py` compares real frozen implementations;
 `tests/subcell_release_check.py` performs full-size T3/checkpoint release gates.
-Read their CLI help and use fresh external outputs. Historical diagnostic snapshots
-remain scoped to their own source hashes; later documentation does not relabel them.
+Read their CLI help and use fresh external outputs. The clean suite now passes
+27 tests, including the non-improving-AP recovery regression. Fresh CPU native MAE
+and ViT resume probes also pass with zero parameter differences. These are bounded
+checks, not fresh full-size GPU training runs. GitHub CI is not claimed: publication
+of the prepared workflow requires a credential with `workflow` scope.
+Historical diagnostic snapshots remain scoped to their own source hashes; later
+documentation does not relabel them.

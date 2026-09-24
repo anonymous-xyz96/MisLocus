@@ -5,6 +5,56 @@ weights, crop release or embedding payloads themselves. The new outputs remain i
 external storage; they have not been uploaded to the frozen HF dataset by this PR.
 No raw data, private host paths or internal planning history is committed here.
 
+## Matched frozen controls: completed follow-up
+
+Both four-channel HPA controls completed on 2026-09-24 from source `d0c61f0`:
+`subcell_frozen_rybg_v2_mae` and `subcell_frozen_rybg_v2_vit`. Each has 3,332,309 cells
+and 1,536 finite FP32 features over all six batches/T1–T4. Full readback checks every
+feature and compares every ordered metadata column against the corresponding
+adapted export. The inference implementation and locked library versions match
+those used for adapted extraction; weights are the intended difference.
+
+- [`subcell-v2-frozen-completion.json`](subcell-v2-frozen-completion.json): actual
+  source, weight/input/output bindings, matching checks, resource events and tests.
+- [`subcell-v2-frozen-receipts.sha256`](subcell-v2-frozen-receipts.sha256): 121
+  receipts/snapshots, source/operational archives, pilots, verification and regression logs.
+- [`subcell-v2-frozen-payloads.sha256`](subcell-v2-frozen-payloads.sha256): the twelve
+  full frozen embedding Parquets, relative to `ARTIFACT_ROOT`.
+- [`subcell-v2-frozen-weights.sha256`](subcell-v2-frozen-weights.sha256): the two HPA
+  encoder/pool inputs, relative to the separate RYBG `WEIGHTS_ROOT`.
+
+```bash
+set -euo pipefail
+CODE=/absolute/path/to/this/code-checkout
+ARTIFACT_ROOT=/absolute/path/to/artifact-store
+WEIGHTS_ROOT=/absolute/path/to/rybg-weights
+cd "$ARTIFACT_ROOT"
+sha256sum --check "$CODE/docs/evidence/subcell-v2-frozen-receipts.sha256"
+sha256sum --check "$CODE/docs/evidence/subcell-v2-frozen-payloads.sha256"
+# WEIGHTS_ROOT contains mae_contrast_supcon_model/ and vit_supcon_model/.
+cd "$WEIGHTS_ROOT"
+sha256sum --check "$CODE/docs/evidence/subcell-v2-frozen-weights.sha256"
+```
+
+The [current review follow-up](../reviews/subcell-v2-readiness-followup.md) records
+27 passing CPU tests, exact tiny-model resume checks, the corrected plateau recovery
+bug, and the CI-publication permission limitation. Repeated frozen GPU pilots matched
+exactly for288 cells/model; this is a bounded check, not universal reproducibility.
+A separate CPU-bounded post-export crop audit rehashed **17,060 files /
+436,847,345,580 bytes** against the unchanged original extraction receipt. The
+producer retains its original input-rehash binding; this later audit is an additive
+record, not a rewritten receipt or a guarantee of filesystem immutability.
+Matched **raw** controls now exist; matched downstream processing, scientific
+comparisons, public artifact distribution and manuscript synchronization remain
+separate work. The original training/adapted artifacts were not regenerated.
+
+## Original training/adapted package: unchanged snapshot
+
+The following inventories retain their original 2026-09-23 scope and bytes. Their
+then-pending frozen-control statements are historical, not the status of the
+completed follow-up above. Original reports have not been rewritten to hide the
+later-discovered checkpoint defect.
+
 - [`subcell-v2-completion.json`](subcell-v2-completion.json): six native selected
   checkpoints, both complete seed42 all-split exports, source identities, counts,
   metrics, runtime, resource events and the remaining interpretation limits.
@@ -76,9 +126,10 @@ Original source archives and the approved contract remain authoritative for old 
   unmeasured. Historical missing determinism flags have not been reconstructed.
 - Seed42-only exported/downstream results do not demonstrate multi-seed robustness.
   T3 allele AP is neither mislocalization performance nor unseen-allele generalization.
-- Matched frozen four-channel bulk exports, downstream policy/implementation review,
-  manuscript synchronization and public artifact distribution remain separate work.
-  Nothing here certifies XGBoost/copairs results or licenses T4-driven tuning.
+- The original package did not include matched frozen bulk exports; the additive
+  follow-up above now binds those completed controls. Downstream policy/implementation
+  review, manuscript synchronization and public artifact distribution remain separate
+  work. Neither package certifies XGBoost/copairs results or licenses T4-driven tuning.
 
 Consumers must check `extraction.json` plus the corresponding full verification
 receipt and file hashes, then write only into a separate analysis root. A pilot,

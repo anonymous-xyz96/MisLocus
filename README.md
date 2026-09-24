@@ -123,10 +123,13 @@ Hugging Face mirror unchanged and stages crops/run outputs separately.
 Six fresh MAE/ViT × seed42/43/44 fits and the two seed42 all-T1–T4 raw exports
 are complete and verified. Each export contains 3,332,309 cells × 1,536 FP32
 features. See the [completion evidence and limitations](docs/evidence/README.md)
-and [merge review](docs/reviews/subcell-v2-merge-review.md). These outputs are in
-external versioned storage, **not uploaded into the frozen HF bundle**. Historical
-features are not relabeled as v2. Matched four-channel frozen bulk exports and
-downstream scientific/evaluation policies remain separate gates; single-seed
+and [current review follow-up](docs/reviews/subcell-v2-readiness-followup.md).
+Matched frozen four-channel MAE/ViT bulk exports are also complete: the same
+3,332,309 cells per model, with full readback and exact ordered metadata matching.
+See their [additive evidence inventory](docs/evidence/subcell-v2-frozen-completion.json).
+These outputs are in external versioned storage, **not uploaded into the frozen HF
+bundle**. Historical features are not relabeled as v2. Matched downstream processing
+and scientific/evaluation policies remain separate gates; single-seed adapted
 reporting does not establish seed robustness.
 
 ## Adding a new representation
