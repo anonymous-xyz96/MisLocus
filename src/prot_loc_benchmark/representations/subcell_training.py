@@ -354,12 +354,12 @@ class SubCellAlleleModule(L.LightningModule):
             summary = {'identity': self.identity, 'global_step': self.global_step,
                        'selection': json.loads(selection.read_text()) if selection.exists() else None,
                        'status': 'fit_completed', 'attempt': str(self.attempt_dir.relative_to(self.output_dir))}
-            save_json(self.attempt_dir / 'completed.json', summary)
             inputs = [self.output_dir / 'run.json', self.output_dir / 'source.json']
             if self.identity.get('config'):
                 inputs += [Path(self.identity['config']['preflight']) / 'preflight.json',
                            Path(self.identity['config']['pretrained_weights'])]
             record([self.attempt_dir], input_paths=[p for p in inputs if p.exists()])
+            save_json(self.attempt_dir / 'completed.json', summary)
 
     def on_validation_epoch_start(self):
         if self.device.type == 'cuda':
