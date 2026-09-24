@@ -122,7 +122,7 @@ def align_crop_rows(released, base_path):
 
 def build_manifest(root, crops, output):
     """Validate a completed extraction and save immutable cohort + fixed validation IDs."""
-    from .subcell_allele_data import fixed_validation
+    from .subcell_finetune import fixed_validation
     from .subcell_run import capture_source, invocation
 
     root, crops, output = map(Path, (root, crops, output))
