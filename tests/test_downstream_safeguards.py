@@ -11,8 +11,9 @@ from unittest.mock import patch
 import polars as pl
 
 from prot_loc_benchmark import provenance, stages
-from prot_loc_benchmark.identity import CELL_ID, identify_cells
-from prot_loc_benchmark.provenance import save_json
+from prot_loc_benchmark.downstream_inputs import verify_export
+from prot_loc_benchmark.identity import CELL_ID, identify_cells, ordered_id_hash
+from prot_loc_benchmark.provenance import capture_source, code_fingerprint, save_json, sha256
 
 
 def load_script(path, name):
@@ -123,6 +124,129 @@ class Safeguards(unittest.TestCase):
             limits["cpu.max"] = "6500000 100000"
             with self.assertRaisesRegex(ValueError, "ceilings"):
                 stages.require_bounded_execution("subcell_allele_rybg_v2_mae_s42")
+
+    def test_verified_export_contract_rejects_partial_wrong_checkpoint_and_tampering(self):
+        # A small producer-shaped fixture, not a trusted substitute for production verification.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            export = root / "exports" / "subcell_allele_rybg_v2_mae_s42"
+            export.mkdir(parents=True)
+            capture_source(export)
+            control = root / "control"
+            control.mkdir()
+            batch = "fixture_batch"
+            rep = export.name
+            frame = pl.DataFrame(
+                {
+                    "Metadata_Plate": [f"P_T{i}" for i in range(1, 5)],
+                    "Metadata_Well": ["A01"] * 4,
+                    "Metadata_Site": [1] * 4,
+                    "Metadata_ImageNumber": [1] * 4,
+                    "Metadata_ObjectNumber": [1] * 4,
+                    "Metadata_CellID": [f"cell{i}" for i in range(4)],
+                    "Metadata_Split": ["train", "train", "val", "test"],
+                    **{f"SubCell_{i}": pl.Series([1.0, 2.0, 3.0, 4.0], dtype=pl.Float32) for i in range(1536)},
+                }
+            )
+            frame = identify_cells(frame, batch)
+            path = export / batch / "embeddings.parquet"
+            path.parent.mkdir()
+            frame.write_parquet(path)
+            counts = {"train": 2, "val": 1, "test": 1}
+            output = {
+                "cells": 4,
+                "sha256": sha256(path),
+                "split_counts": counts,
+                "ordered_cell_ids_sha256": ordered_id_hash(frame),
+            }
+            checkpoint, selection, preflight, crops = [
+                root / n for n in ("checkpoint", "selection.json", "preflight.json", "crops.json")
+            ]
+            for dependency in (checkpoint, selection, preflight, crops):
+                dependency.write_text("{}")
+            spec = {
+                "models": {
+                    "mae": {
+                        "representation": rep,
+                        "checkpoint": str(checkpoint),
+                        "checkpoint_sha256": sha256(checkpoint),
+                        "selected_pass": 100,
+                        "selection": str(selection),
+                        "selection_sha256": sha256(selection),
+                    }
+                },
+                "expected_batch_split_counts": {batch: counts},
+                "control": str(control),
+                "export_root": str(root / "exports"),
+                "training_code_sha256": "training",
+                "code_sha256": code_fingerprint(),
+                "source_commit": json.loads((export / "source.json").read_text())["git_head"],
+                "preflight": str(root),
+                "preflight_sha256": sha256(preflight),
+                "crop_verification": str(crops),
+                "crop_verification_sha256": sha256(crops),
+            }
+            spec_path = root / "run-spec.json"
+            save_json(spec_path, spec)
+            spec_path.with_suffix(".sha256").write_text(sha256(spec_path))
+            receipt = {
+                "status": "complete",
+                "artifact_kind": "raw_embeddings",
+                "split": "all",
+                "family": "mae",
+                "checkpoint_sha256": sha256(checkpoint),
+                "selected_pass": 100,
+                "outputs": {batch: output},
+                "training": {"code_sha256": "training"},
+                "invocation": {"code_sha256": code_fingerprint()},
+                "source_archive_sha256": sha256(export / "source.tar.gz"),
+                "feature_columns": [f"SubCell_{i}" for i in range(1536)],
+            }
+
+            def publish(value, status="complete"):
+                save_json(export / "extraction.json", value)
+                verification = control / "verified-production-mae.json"
+                save_json(
+                    verification, {"receipt_sha256": sha256(export / "extraction.json"), "outputs": value["outputs"]}
+                )
+                save_json(
+                    control / "production-status.json",
+                    {
+                        "status": status,
+                        "spec_sha256": sha256(spec_path),
+                        "jobs": {"mae": {"verified_receipt_sha256": sha256(verification)}},
+                    },
+                )
+
+            publish(receipt)
+            inputs = verify_export(spec_path, rep, batch, path)
+            self.assertIn(checkpoint, inputs)
+            for changed in (
+                {**receipt, "split": "test"},
+                {**receipt, "checkpoint_sha256": "wrong"},
+                {**receipt, "artifact_kind": "diagnostic_embeddings"},
+            ):
+                publish(changed)
+                with self.assertRaisesRegex(ValueError, "Wrong"):
+                    verify_export(spec_path, rep, batch, path)
+            publish(receipt, status="running")
+            with self.assertRaisesRegex(ValueError, "completed"):
+                verify_export(spec_path, rep, batch, path)
+            publish(receipt)
+            original = path.read_bytes()
+            path.write_bytes(original + b"changed")
+            with self.assertRaises(Exception):
+                verify_export(spec_path, rep, batch, path)
+            path.write_bytes(original)
+            frame.with_columns(pl.lit(float("nan"), dtype=pl.Float32).alias("SubCell_0")).write_parquet(path)
+            publish({**receipt, "outputs": {batch: {**output, "sha256": sha256(path)}}})
+            with self.assertRaisesRegex(ValueError, "nonfinite"):
+                verify_export(spec_path, rep, batch, path)
+            path.write_bytes(original)
+            publish(receipt)
+            checkpoint.write_text("changed")
+            with self.assertRaisesRegex(ValueError, "dependency"):
+                verify_export(spec_path, rep, batch, path)
 
 
 if __name__ == "__main__":

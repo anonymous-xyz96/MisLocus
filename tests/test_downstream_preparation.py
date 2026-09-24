@@ -194,6 +194,60 @@ print(json.dumps([str(p) for p in (DATA_DIR, INTERIM_DIR, CLASSIFICATION_OUTPUT_
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("absolute path", result.stderr)
 
+    @unittest.skipUnless(importlib.util.find_spec("pycytominer"), "CLI integration needs the default preprocessing env")
+    def test_embedding_preprocessing_cli_uses_external_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            batch, rep = "2024_01_23_Batch_7", "vit"
+            folder = root / "interim" / rep / batch
+            folder.mkdir(parents=True)
+            raw = folder / "embeddings.parquet"
+            pl.DataFrame(
+                {
+                    "Metadata_CellID": [str(i) for i in range(24)],
+                    "Metadata_Plate": ["fixture_P1T4"] * 24,
+                    "Metadata_Well": ["A01"] * 24,
+                    "Metadata_ImageNumber": [1] * 24,
+                    "Metadata_ObjectNumber": list(range(24)),
+                    "SubCell_0": [float(i) if i != 7 else float("nan") for i in range(24)],
+                }
+            ).write_parquet(raw)
+            before = sha256(raw)
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(REPO_ROOT / "src"),
+                "MISLOCUS_DATA_ROOT": str(root),
+                "CUDA_VISIBLE_DEVICES": "",
+                "OMP_NUM_THREADS": "1",
+                "OPENBLAS_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+                "POLARS_MAX_THREADS": "2",
+            }
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/06_preprocess_profiles.py"),
+                    "--batch",
+                    batch,
+                    "--representation",
+                    rep,
+                    "--normalized-only",
+                ],
+                env=env,
+                cwd=root,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            normalized = pl.read_parquet(folder / "normalized.parquet")
+            self.assertEqual(normalized.height, 23)
+            self.assertNotIn("7", normalized["Metadata_CellID"].to_list())
+            self.assertTrue(normalized["SubCell_0"].is_finite().all())
+            self.assertEqual(sha256(raw), before)
+            self.assertTrue((folder / "plate_stats.parquet").exists())
+            self.assertTrue((folder / "_provenance.json").exists())
+            self.assertEqual(len(json.loads((root / "provenance_log.json").read_text())["runs"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
