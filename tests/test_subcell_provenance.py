@@ -93,6 +93,15 @@ class ProvenanceChecks(unittest.TestCase):
                 self.assertNotEqual(snapshots.code_fingerprint(), without_plan)
                 self.assertIn(plan, snapshots.source_files())
 
+    def test_frozen_and_adapted_cli_are_separate(self):
+        from prot_loc_benchmark.representations.subcell_extract import main
+        common = ['extract', '--preflight', 'unused', '--family', 'mae', '--output', 'unused']
+        for frozen, wrong_source in ((True, ['--checkpoint', 'unused']),
+                                     (False, ['--frozen-weights', 'unused', '--weights-sha256', 'unused'])):
+            with patch('sys.argv', common + wrong_source), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as failure:
+                    main(frozen=frozen)
+            self.assertEqual(failure.exception.code, 2)
 
     def test_separate_extraction_preflight_and_tamper_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
