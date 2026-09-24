@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "kind": "historical_campaign_evidence_and_new_port_validation",
+  "producer_base": "fa11c25b5d21281b90ba0478ebe6a6f266f81402",
+  "port_code_commit": "29ef77d775f241b99c83c6f05172835e43eb5c49",
+  "publication_reference": "469f563bca33f3be7eee03385152d3f023011269",
+  "pixi_lock_sha256": "e543d837e4e7f236554e2a4f426489119836b59792a74b97b9369b7f0f09ca1a",
+  "campaign": {
+    "name": "downstream-s42-all-v2",
+    "status": "complete",
+    "acceptance_sha256": "ce9aa1be8da53b10b76d7c19ce756b9978282548d37dc48675a4c2511fcdfe51",
+    "campaign_status_sha256": "03eb376366b06ee890fea7b05ab25fde8e53d24a8bc1939e11692c8924097bc6",
+    "spec_sha256": "e9534722a68c1252438673f6bf28ad03f2171837aede6400143569ebb46571ef",
+    "completed_at": "2026-09-24T15:15:38.823266+00:00",
+    "stage_receipts_rehashed": 48,
+    "explicit_older_source_reuse_receipts": 9,
+    "source_code_sha256s": [
+      "674a6d9839ed998bd28bcc6bf6d333810bf3c1e779048b4f52b98feabfd9802d",
+      "ad727bb917dc8b2dd4c86d165ca40c0dba995f75ff8b72483cc6fd6b8ad15902"
+    ],
+    "models": {
+      "subcell_allele_rybg_v2_mae_s42": {
+        "retained_cells": 3330277,
+        "control_fits": 354,
+        "experimental_fits": 1824,
+        "xgb_summary_rows": 1617,
+        "pa_results": 1913,
+        "loo_controls": 275
+      },
+      "subcell_allele_rybg_v2_vit_s42": {
+        "retained_cells": 3330277,
+        "control_fits": 354,
+        "experimental_fits": 1824,
+        "xgb_summary_rows": 1617,
+        "pa_results": 1913,
+        "loo_controls": 275
+      }
+    },
+    "audit_scope": "Rehashed acceptance, 48 stage receipts and 60 small score files; not a new full payload verification or scientific rerun."
+  },
+  "port_validation": {
+    "changed_python_files": 29,
+    "donor_byte_identical_python_files": 27,
+    "merged_shared_files": [
+      "src/prot_loc_benchmark/config.py",
+      "src/prot_loc_benchmark/provenance.py"
+    ],
+    "preserved_producer_functions": [
+      "read_json_with_hash",
+      "capture_source",
+      "invocation",
+      "verify_source"
+    ],
+    "downstream_tests": 32,
+    "shared_source_crop_tests": 4,
+    "producer_provenance_campaign_tests": 11,
+    "gpu_jobs_launched": 0,
+    "ruff_version": "0.16.3",
+    "independent_review": false,
+    "unit_limits": {
+      "cpu_equivalents": 4,
+      "memory_high_gib": 24,
+      "memory_max_gib": 32,
+      "tasks": 256
+    },
+    "stack_steps": [
+      {
+        "step": 1,
+        "commit": "f7d30c5c6dc9798d98f1fc228546be3ac45f6135",
+        "changed_lines": 303,
+        "cumulative_tests": 2,
+        "test_seconds": 0.177,
+        "test_log_sha256": "c28cbde47d2661d5f75c242ef01ba7fbe0497bc22e7eb741dd7d1cb05112183d"
+      },
+      {
+        "step": 2,
+        "commit": "2bf7dedd9ba9ebf55028f231a716791f3c48e945",
+        "changed_lines": 453,
+        "cumulative_tests": 5,
+        "test_seconds": 2.893,
+        "test_log_sha256": "f7c024fc3eb08f8679ff2554bbaec6948e8882a84a44dfa14dca22bc1954adb8"
+      },
+      {
+        "step": 3,
+        "commit": "976e070565a5d694cee1b198ba254d62c3002920",
+        "changed_lines": 463,
+        "cumulative_tests": 10,
+        "test_seconds": 2.191,
+        "test_log_sha256": "5243fb62e61ca32b61007adb408cfb9644509cc271c8fda812ecadafd02a430d"
+      },
+      {
+        "step": 4,
+        "commit": "aef6ed61fcc77761ede1b54f9e71508cb78857e0",
+        "changed_lines": 413,
+        "cumulative_tests": 12,
+        "test_seconds": 4.385,
+        "test_log_sha256": "53b6843a477b615301b60ba68fa955766134b0a4a4a20da7339777e11b99976d"
+      },
+      {
+        "step": 5,
+        "commit": "5d0086259bad2ccec3d1b99a6413f103c2d1fca1",
+        "changed_lines": 379,
+        "cumulative_tests": 14,
+        "test_seconds": 4.342,
+        "test_log_sha256": "e24e0ab294ee913b32040ef88d57bf75fa4cff593e19a8ffc0faf8ea64da172a"
+      },
+      {
+        "step": 6,
+        "commit": "40aafe96f8d35b97900fe9c211d39d575c00814f",
+        "changed_lines": 519,
+        "cumulative_tests": 20,
+        "test_seconds": 4.82,
+        "test_log_sha256": "ab10358f219c395c16f154abda689b811388aaa5c4d4bf1126484e7815bfee3b"
+      },
+      {
+        "step": 7,
+        "commit": "7a290edde7928e47952067ef7797879aa8d5ffef",
+        "changed_lines": 512,
+        "cumulative_tests": 21,
+        "test_seconds": 4.836,
+        "test_log_sha256": "b7072a72b99e1d6306c3a219b22ec945c8dc4a9d86a37ef2e1fcf89aae82e79f"
+      },
+      {
+        "step": 8,
+        "commit": "ed0ed50378d8fbcb35b4b1e52743d47d896f687e",
+        "changed_lines": 743,
+        "cumulative_tests": 26,
+        "test_seconds": 4.933,
+        "test_log_sha256": "ab6239fd09a0fb5d1233d8edee39b739ac0330f463ef2da6b187163f72980414"
+      },
+      {
+        "step": 9,
+        "commit": "be5b8e40c9fa82a1bc0ca15660ffe43393aef722",
+        "changed_lines": 430,
+        "cumulative_tests": 29,
+        "test_seconds": 8.648,
+        "test_log_sha256": "478185a7109f741ab41d93120658dc5c5e600c09ba8a5f33df3e3e464e9e2639"
+      },
+      {
+        "step": 10,
+        "commit": "29ef77d775f241b99c83c6f05172835e43eb5c49",
+        "changed_lines": 669,
+        "cumulative_tests": 32,
+        "test_seconds": 37.76,
+        "test_log_sha256": "a21bde71746659d1e5573a29ceeac023628fbe38cefeff31fe1c82368fbd52ed"
+      }
+    ],
+    "compatibility_logs": {
+      "shared-regressions.log": "7435ac6b493f275a26489742a70fe7a9e507b8ff9815abd4167dfb48bb6a1f0e",
+      "producer-regressions-v2.log": "5bbeead76259c4d888a7f090b60cb6868804a35ee9f289e2c86856559dd6f22b"
+    },
+    "harness_correction": "First producer-test invocation omitted vendor/subcell_embed from PYTHONPATH; corrected invocation passed 11 tests. Both logs retained locally."
+  },
+  "preservation": {
+    "donor_snapshot_sha256": "c7126de5f1ae6014558a0e672c4e706a785e5ec20516859b60f4b20f4fd742bf",
+    "donor_files_unchanged": 50,
+    "main_historical_plan_unchanged": true,
+    "manuscript_tracked_files_unchanged": 836,
+    "original_worktrees_cleaned_or_reset": false
+  }
+}
