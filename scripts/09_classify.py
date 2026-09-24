@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 def _parse_template_number(plate: str) -> int | None:
     """Extract template number (1-4) from plate barcode."""
     import re
+
     # Use [0-9] instead of \d — conda-forge Python 3.12 has a broken \d
     m = re.search(r"T([0-9]+)$", plate)
     return int(m.group(1)) if m else None
@@ -107,8 +108,14 @@ def classify_batch(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 70)
-    logger.info("Classification: batch=%s rep=%s layout=%s scope=%s unseen_only=%s",
-                batch_id, representation, layout, scope, unseen_only)
+    logger.info(
+        "Classification: batch=%s rep=%s layout=%s scope=%s unseen_only=%s",
+        batch_id,
+        representation,
+        layout,
+        scope,
+        unseen_only,
+    )
     logger.info("=" * 70)
 
     # ── Device selection ─────────────────────────────────────────────
@@ -136,15 +143,14 @@ def classify_batch(
     # Filter to unseen plates (T3+T4) for strict DL evaluation
     if unseen_only:
         df_full = df_full.with_columns(
-            pl.col("Metadata_Plate").map_elements(
-                _parse_template_number, return_dtype=pl.Int64
-            ).alias("_template")
+            pl.col("Metadata_Plate").map_elements(_parse_template_number, return_dtype=pl.Int64).alias("_template")
         )
         n_before = df_full.height
         df_full = df_full.filter(pl.col("_template").is_in([3, 4])).drop("_template")
         logger.info(
             "Unseen-only filter: %d → %d cells (T3+T4 plates only)",
-            n_before, df_full.height,
+            n_before,
+            df_full.height,
         )
 
     # Wrap as lazy for pair building (which only needs group_by counts)
@@ -169,9 +175,10 @@ def classify_batch(
         missing = [c for c in channels if c not in channel_features]
         if missing:
             logger.error(
-                "Requested --channels %s not available for representation %r "
-                "(available: %s)",
-                missing, representation, sorted(channel_features),
+                "Requested --channels %s not available for representation %r (available: %s)",
+                missing,
+                representation,
+                sorted(channel_features),
             )
             sys.exit(1)
         channel_features = {c: channel_features[c] for c in channels}
@@ -200,22 +207,28 @@ def classify_batch(
                 if train_df.height < MIN_CELL_COUNT or test_df.height < 10:
                     continue
 
-                tasks.append({
-                    "pair": pair,
-                    "channel": channel,
-                    "ch_features": ch_features,
-                    "fold": fold,
-                    "train_df": train_df,
-                    "test_df": test_df,
-                })
+                tasks.append(
+                    {
+                        "pair": pair,
+                        "channel": channel,
+                        "ch_features": ch_features,
+                        "fold": fold,
+                        "train_df": train_df,
+                        "test_df": test_df,
+                    }
+                )
 
     logger.info(
         "Prepared %d classifier tasks from %d pairs (%d skipped)",
-        len(tasks), n_pairs, n_skipped,
+        len(tasks),
+        n_pairs,
+        n_skipped,
     )
 
     metrics_rows, importance_rows, info_rows, n_classifiers = run_classifier_tasks(
-        tasks, device=device, output_dir=output_dir,
+        tasks,
+        device=device,
+        output_dir=output_dir,
     )
 
     # ── Write output files ───────────────────────────────────────────
@@ -271,7 +284,7 @@ def classify_batch(
 
     # ── AUROC distribution plot ──────────────────────────────────────
     if not control_metrics.is_empty() and not exp_metrics.is_empty():
-        plot_auroc_distributions(control_metrics, exp_metrics, output_dir, batch_id)
+        plot_auroc_distributions(control_metrics, exp_metrics, output_dir, batch_id, null_thresholds)
 
     elapsed = time.time() - t0
     logger.info("=" * 70)
@@ -280,9 +293,7 @@ def classify_batch(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="XGBoost classification for variant mislocalization prediction."
-    )
+    parser = argparse.ArgumentParser(description="XGBoost classification for variant mislocalization prediction.")
     parser.add_argument(
         "--batch",
         required=True,
@@ -331,10 +342,7 @@ def main() -> None:
     suffix = "_unseen" if args.unseen_only else ""
     output_dir = CLASSIFICATION_OUTPUT_DIR / (args.representation + suffix) / args.batch
 
-    channels = (
-        [c.strip() for c in args.channels.split(",") if c.strip()]
-        if args.channels else None
-    )
+    channels = [c.strip() for c in args.channels.split(",") if c.strip()] if args.channels else None
 
     try:
         classify_batch(
@@ -348,6 +356,7 @@ def main() -> None:
     finally:
         if output_dir.exists():
             from prot_loc_benchmark.provenance import record
+
             record(output_dirs=[output_dir])
 
 

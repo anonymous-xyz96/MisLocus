@@ -32,14 +32,12 @@ def generate_folds_single_rep(df: pl.DataFrame) -> list[CVFold]:
     """
     plate_info = df.select("Metadata_Plate", "Metadata_plate_map_name").unique()
 
-    platemap_counts = plate_info.group_by("Metadata_plate_map_name").agg(
-        pl.col("Metadata_Plate").alias("plates")
-    )
+    platemap_counts = plate_info.group_by("Metadata_plate_map_name").agg(pl.col("Metadata_Plate").alias("plates"))
 
     folds: list[CVFold] = []
     fold_id = 0
 
-    for row in platemap_counts.iter_rows(named=True):
+    for row in platemap_counts.sort("Metadata_plate_map_name").iter_rows(named=True):
         plates = sorted(row["plates"])
         if len(plates) < 2:
             continue
@@ -47,10 +45,7 @@ def generate_folds_single_rep(df: pl.DataFrame) -> list[CVFold]:
         for i, test_plate in enumerate(plates):
             train_plates = [p for j, p in enumerate(plates) if j != i]
             test_wells = (
-                df.filter(pl.col("Metadata_Plate") == test_plate)["Metadata_well_position"]
-                .unique()
-                .sort()
-                .to_list()
+                df.filter(pl.col("Metadata_Plate") == test_plate)["Metadata_well_position"].unique().sort().to_list()
             )
             train_wells = (
                 df.filter(pl.col("Metadata_Plate").is_in(train_plates))["Metadata_well_position"]
@@ -87,16 +82,8 @@ def generate_folds_multi_rep(df: pl.DataFrame) -> list[CVFold]:
         raise ValueError("DataFrame must have a 'Label' column (call get_pair_data first)")
 
     plates = df["Metadata_Plate"].unique().to_list()
-    ref_wells = sorted(
-        df.filter(pl.col("Label") == 1)["Metadata_well_position"]
-        .unique()
-        .to_list()
-    )
-    var_wells = sorted(
-        df.filter(pl.col("Label") == 0)["Metadata_well_position"]
-        .unique()
-        .to_list()
-    )
+    ref_wells = sorted(df.filter(pl.col("Label") == 1)["Metadata_well_position"].unique().to_list())
+    var_wells = sorted(df.filter(pl.col("Label") == 0)["Metadata_well_position"].unique().to_list())
 
     # Pair wells positionally
     n_pairs = min(len(ref_wells), len(var_wells))
@@ -137,12 +124,14 @@ def generate_folds_multi_rep(df: pl.DataFrame) -> list[CVFold]:
 
     logger.debug(
         "multi_rep: %d well-pairs → C(%d,2)=%d folds",
-        n_pairs, n_pairs, len(folds),
+        n_pairs,
+        n_pairs,
+        len(folds),
     )
     return folds
 
 
-def generate_folds(df: pl.DataFrame, layout: str) -> list[CVFold]:
+def generate_folds(df: pl.DataFrame, layout: str, test_split: str | None = None) -> list[CVFold]:
     """Generate CV folds based on plate layout.
 
     Args:
@@ -153,6 +142,13 @@ def generate_folds(df: pl.DataFrame, layout: str) -> list[CVFold]:
         - single_rep: up to 4 folds (leave-one-plate-out)
         - multi_rep: C(4,2)=6 folds (choose-2 well-pairs for test)
     """
+    if test_split not in (None, "t4"):
+        raise ValueError(f"Unknown test split: {test_split}")
+    if test_split == "t4":
+        if layout != "single_rep":
+            raise ValueError("T4 holdout requires single_rep layout")
+        if df["Metadata_Plate"].null_count() or not df["Metadata_Plate"].str.contains(r"T[1-4]$").all():
+            raise ValueError("T4 holdout requires explicit T1/T2/T3/T4 plate names")
     if layout == "single_rep":
         folds = generate_folds_single_rep(df)
     elif layout == "multi_rep":
@@ -160,7 +156,16 @@ def generate_folds(df: pl.DataFrame, layout: str) -> list[CVFold]:
     else:
         raise ValueError(f"Unknown layout: {layout!r}")
 
-    logger.debug("Generated %d CV folds for layout=%s", len(folds), layout)
+    if test_split == "t4":
+        folds = [fold for fold in folds if all(p.endswith("T4") for p in fold.test_plates)]
+        supported = []
+        for fold in folds:
+            if len(fold.train_plates) == 3 and {p[-2:] for p in fold.train_plates} == {"T1", "T2", "T3"}:
+                supported.append(fold)
+            else:
+                logger.warning("Skipping T4 holdout %s: missing T1/T2/T3 training plates", fold.test_plates)
+        folds = supported
+    logger.debug("Generated %d evaluation splits for layout=%s", len(folds), layout)
     return folds
 
 
@@ -179,11 +184,7 @@ def split_fold(
         test_df = df.filter(pl.col("Metadata_Plate").is_in(fold.test_plates))
     else:
         # multi_rep: split by wells within same plate
-        train_df = df.filter(
-            pl.col("Metadata_well_position").is_in(fold.train_wells)
-        )
-        test_df = df.filter(
-            pl.col("Metadata_well_position").is_in(fold.test_wells)
-        )
+        train_df = df.filter(pl.col("Metadata_well_position").is_in(fold.train_wells))
+        test_df = df.filter(pl.col("Metadata_well_position").is_in(fold.test_wells))
 
     return train_df, test_df
