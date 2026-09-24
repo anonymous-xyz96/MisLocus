@@ -3,10 +3,12 @@
 Tiny synthetic architecture/data only; missing real data/config bindings prevent
 these test checkpoints from being accepted by production embedding extraction.
 """
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import lightning as L
@@ -48,6 +50,25 @@ class InterruptAtPass(Callback):
 
 
 class ProductionResumeChecks(unittest.TestCase):
+    def test_ledger_failure_cannot_publish_fit_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = SubCellAlleleModule(tiny_components('vit'), ['a', 'b'], {}, root)
+            module.trainer = SimpleNamespace(is_global_zero=True, global_step=1)
+            module.attempt_dir = root / 'attempts/test'
+            module.attempt_dir.mkdir(parents=True)
+            ledger = root / 'ledger.json'
+            ledger.write_text('invalid json')
+            with patch.object(provenance, 'PROVENANCE_LOG', ledger):
+                with self.assertRaises(json.JSONDecodeError):
+                    module.on_fit_end()
+                self.assertFalse((module.attempt_dir / 'completed.json').exists())
+                ledger.unlink()
+                module.on_fit_end()
+                self.assertEqual(json.loads((module.attempt_dir / 'completed.json').read_text())['status'],
+                                 'fit_completed')
+                self.assertEqual(len(json.loads(ledger.read_text())['runs']), 1)
+
     def test_plateau_saves_latest_state_and_terminal_interruption_cannot_resume(self):
         torch.set_num_threads(1)
         with tempfile.TemporaryDirectory() as directory:
