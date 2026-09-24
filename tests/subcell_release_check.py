@@ -62,6 +62,7 @@ def main():
     if int(os.environ['RANK']) == 0:
         output.mkdir(parents=True, exist_ok=False)
         capture_source(output)
+        verify_source(output, identity['code_sha256'])
         save_json(output / 'run.json', identity)
         save_json(output / 'class_index.json', classes)
         save_json(output / 'validation_ids.json', validation)

@@ -125,9 +125,9 @@ def build_manifest(root, crops, output):
     from .subcell_finetune import fixed_validation
     from .subcell_run import capture_source, invocation
 
-    root, crops, output = map(Path, (root, crops, output))
-    if output.resolve().is_relative_to(root.resolve()):
-        raise ValueError('Preflight must not write inside the Hugging Face mirror')
+    root, crops, output = (Path(p).resolve() for p in (root, crops, output))
+    if any(output.is_relative_to(p) for p in (root, crops)):
+        raise ValueError('Preflight must not write inside the Hugging Face mirror or crop inputs')
     inventory = release_inventory(root)
     receipt_path = crops / 'extraction.json'
     if not receipt_path.exists():
@@ -171,7 +171,7 @@ def build_manifest(root, crops, output):
     save_json(output / 'preflight.json', {
         'protocol': PROTOCOL, 'release': inventory, 'release_root': str(root.resolve()),
         'crops_root': str(crops.resolve()),
-        'invocation': invocation(), 'source_archive_sha256': sha256(output / 'source.tar.gz'),
+        'invocation': invocation(output), 'source_archive_sha256': sha256(output / 'source.tar.gz'),
         'extraction_sha256': sha256(receipt_path),
         'manifest_sha256': sha256(output / 'manifest.parquet'),
         'class_index_sha256': sha256(output / 'class_index.json'),
