@@ -31,7 +31,13 @@ import logging
 import sys
 import time
 
+from prot_loc_benchmark.stages import bound_environment
+
+bound_environment()
+# ruff: noqa: E402 -- native thread bounds must precede numerical-library imports.
+
 import numpy as np
+import pandas as pd
 import polars as pl
 from copairs.map import average_precision, mean_average_precision
 from copairs.map.multilabel import average_precision as average_precision_multilabel
@@ -40,9 +46,13 @@ from copairs.matching import assign_reference_index
 REFERENCE_COL = "Metadata_reference_index"
 HPA_LABELS_COL = "Metadata_hpa_locations"
 
+import hashlib
+import itertools
+
 from prot_loc_benchmark.classification.channels import get_feature_channels
 from prot_loc_benchmark.config import (
     BATCH_LAYOUT,
+    CELLPROFILER_DIR,
     HPA_GENE_LOCALIZATION_PATH,
     INTERIM_DIR,
     MIN_CELL_COUNT,
@@ -50,7 +60,13 @@ from prot_loc_benchmark.config import (
     PROCESSED_DIR,
     REP_FEATURE_FILES,
 )
-from prot_loc_benchmark.provenance import record
+from prot_loc_benchmark.copairs_runtime import bounded_copairs
+from prot_loc_benchmark.identity import CELL_ID, identify_cells
+from prot_loc_benchmark.provenance import save_json
+from prot_loc_benchmark.stages import require_bounded_execution, require_stage, stage
+
+_TRACE_DIR = None
+_TRACE_CALLS = itertools.count()
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -92,13 +108,15 @@ def _load_cellprofiler(batch_id: str, cp_feature_file: str = "normalized") -> pl
             sys.exit(1)
         ctrl_df = (
             pl.scan_parquet(str(feat_path))
-            .select([
-                "Metadata_Plate",
-                "Metadata_Well",
-                "Metadata_ImageNumber",
-                "Metadata_ObjectNumber",
-                "Metadata_Control",
-            ])
+            .select(
+                [
+                    "Metadata_Plate",
+                    "Metadata_Well",
+                    "Metadata_ImageNumber",
+                    "Metadata_ObjectNumber",
+                    "Metadata_Control",
+                ]
+            )
             .collect()
         )
         df = df.join(
@@ -108,7 +126,8 @@ def _load_cellprofiler(batch_id: str, cp_feature_file: str = "normalized") -> pl
         )
         logger.info(
             "CellProfiler [%s]: %d cells after join with features.parquet",
-            filename, df.height,
+            filename,
+            df.height,
         )
     else:
         logger.info("CellProfiler [%s]: %d cells", filename, df.height)
@@ -141,6 +160,8 @@ def _sample_per_site(
 ) -> pl.DataFrame:
     """Sample up to N cells per (group_cols) group."""
     rng = np.random.default_rng(seed)
+    identity_col = CELL_ID if CELL_ID in df.columns else "Metadata_ProfileID"
+    df = df.sort(group_cols + [identity_col])
     parts = df.partition_by(group_cols, maintain_order=True)
     sampled = []
     for part in parts:
@@ -161,14 +182,33 @@ def _aggregate_per_group(
 
     Returns one row per group with median features and first-row metadata.
     """
-    meta_cols = [c for c in df.columns if c.startswith("Metadata_") and c not in group_cols]
+    if "Metadata_ImageNumber" in group_cols:
+        for coordinate in ("Metadata_Well", "Metadata_Site"):
+            if (
+                coordinate in df.columns
+                and df.group_by(group_cols)
+                .agg(pl.col(coordinate).n_unique().alias("n"))
+                .filter(pl.col("n") != 1)
+                .height
+            ):
+                raise ValueError("Ambiguous FOV: one image identity spans multiple wells/sites")
+    individual = {CELL_ID, "Metadata_CellID", "Metadata_ObjectNumber"}
+    meta_cols = [c for c in df.columns if c.startswith("Metadata_") and c not in group_cols and c not in individual]
     agg_exprs = [pl.col(c).median().alias(c) for c in feat_cols]
     # Keep first value of metadata columns (they're constant within group for the ones we care about)
     agg_exprs += [pl.col(c).first().alias(c) for c in meta_cols]
     # maintain_order=True is REQUIRED for reproducibility: copairs assigns
     # reference indices in row order and ties break by row order, so a
     # non-deterministic group_by produces non-deterministic mAP.
-    return df.group_by(group_cols, maintain_order=True).agg(agg_exprs).sort(group_cols)
+    agg_exprs.append(pl.col(CELL_ID).sort().alias("Metadata_MemberCellIDs"))
+    result = df.group_by(group_cols, maintain_order=True).agg(agg_exprs).sort(group_cols)
+    return result.with_columns(
+        pl.col("Metadata_MemberCellIDs")
+        .map_elements(
+            lambda ids: "median:" + hashlib.sha256("\n".join(ids).encode()).hexdigest(), return_dtype=pl.String
+        )
+        .alias("Metadata_ProfileID")
+    )
 
 
 def _subsample_per_plate(df: pl.DataFrame, n: int, seed: int = 42) -> pl.DataFrame:
@@ -213,12 +253,7 @@ def _resolve_alleles(df: pl.DataFrame, scope: str) -> list[str]:
 
     # Drop alleles below MIN_CELL_COUNT (mirrors build_experimental_pairs min_cells filter)
     cell_counts = var_df.group_by("Metadata_gene_allele").len()
-    valid_alleles = (
-        cell_counts
-        .filter(pl.col("len") >= MIN_CELL_COUNT)
-        ["Metadata_gene_allele"]
-        .to_list()
-    )
+    valid_alleles = cell_counts.filter(pl.col("len") >= MIN_CELL_COUNT)["Metadata_gene_allele"].to_list()
     var_df = var_df.filter(pl.col("Metadata_gene_allele").is_in(valid_alleles))
 
     if scope == "all":
@@ -233,15 +268,9 @@ def _resolve_alleles(df: pl.DataFrame, scope: str) -> list[str]:
     if "all" in keywords:
         result |= set(var_df["Metadata_gene_allele"].unique().to_list())
     if "exp" in keywords:
-        result |= set(
-            var_df.filter(pl.col("Metadata_Control") == "Exp")
-            ["Metadata_gene_allele"].unique().to_list()
-        )
+        result |= set(var_df.filter(pl.col("Metadata_Control") == "Exp")["Metadata_gene_allele"].unique().to_list())
     if "cpc" in keywords:
-        result |= set(
-            var_df.filter(pl.col("Metadata_Control") == "cPC")
-            ["Metadata_gene_allele"].unique().to_list()
-        )
+        result |= set(var_df.filter(pl.col("Metadata_Control") == "cPC")["Metadata_gene_allele"].unique().to_list())
 
     # Explicit allele names (keep only those that exist and pass cell count)
     valid_set = set(valid_alleles)
@@ -252,9 +281,6 @@ def _resolve_alleles(df: pl.DataFrame, scope: str) -> list[str]:
             logger.warning("Scope allele '%s' not found or below MIN_CELL_COUNT — skipped", name)
 
     return sorted(result)
-
-
-
 
 
 # ── mAP computations ─────────────────────────────────────────────────────────
@@ -284,6 +310,11 @@ def _run_map(
     Positive pairs:  same allele + same reference_index (-1), different plates.
     Negative pairs:  differ in allele + reference_index, same neg_sameby group.
 
+    Variant queries without a reference in their negative-pair group (same
+    plate and gene for vs_ref) are excluded, including in control LOO calls.
+    Other plates of the allele remain eligible. The comparison pool stays
+    intact so cross-plate positive partners for supported queries do not change.
+
     ``test_split`` filters the per-row APs before per-allele aggregation.
     Currently supports ``"t4"`` (keep only rows on T4 plates). The pool
     used for AP computation is unchanged — only the queries that get
@@ -304,6 +335,65 @@ def _run_map(
 
     non_feat = [c for c in pool.columns if c not in feat_cols]
     feats_np = pool[feat_cols].to_numpy().astype(np.float32)
+
+    trace = None
+    if _TRACE_DIR is not None:
+        trace = _TRACE_DIR / f"{next(_TRACE_CALLS):05d}"
+        trace.mkdir(parents=True, exist_ok=False)
+        if "Metadata_ProfileID" not in pool.columns:
+            pool["Metadata_ProfileID"] = pool[CELL_ID]
+            pool["Metadata_MemberCellIDs"] = pool[CELL_ID].map(lambda value: [value])
+        pl.from_pandas(pool).with_row_index("pool_row").write_parquet(trace / "profiles.parquet")
+        pl.from_pandas(pool[["Metadata_ProfileID", "Metadata_MemberCellIDs"]]).with_row_index("pool_row").explode(
+            "Metadata_MemberCellIDs"
+        ).rename({"Metadata_MemberCellIDs": CELL_ID}).write_parquet(trace / "members.parquet")
+        save_json(
+            trace / "parameters.json",
+            {
+                "label": label,
+                "features": feat_cols,
+                "reference_condition": reference_condition,
+                "neg_sameby": neg_sameby,
+                "test_split": test_split,
+                "null_size": null_size,
+                "seed": seed,
+                "threshold": threshold,
+                "missing_reference_policy": "skip_variant_plate_queries",
+            },
+        )
+
+    query_mask = pool[REFERENCE_COL] == -1
+    if test_split == "t4":
+        query_mask &= pool["Metadata_Plate"].str.endswith("T4")
+    reference_groups = pd.MultiIndex.from_frame(pool.loc[pool[REFERENCE_COL] != -1, neg_sameby])
+    missing_reference = query_mask & ~pd.MultiIndex.from_frame(pool[neg_sameby]).isin(reference_groups)
+    if missing_reference.any():
+        logger.info(
+            "%s: skipping %d query profiles (%d allele × plate groups) without same-plate references",
+            label,
+            int(missing_reference.sum()),
+            len(pool.loc[missing_reference, ["Metadata_gene_allele", "Metadata_Plate"]].drop_duplicates()),
+        )
+    if trace is not None:
+        excluded = pool.loc[missing_reference, non_feat].assign(
+            pool_row=pool.index[missing_reference], exclusion_reason="missing_same_plate_reference"
+        )
+        pl.from_pandas(excluded).write_parquet(trace / "excluded_queries.parquet")
+    query_mask &= ~missing_reference
+    if not query_mask.any():
+        if trace is not None:
+            pl.from_pandas(pool.loc[query_mask, non_feat]).write_parquet(trace / "queries.parquet")
+            save_json(
+                trace / "status.json",
+                {
+                    "status": "not_estimable",
+                    "reason": "missing_same_plate_reference" if missing_reference.any() else "no_query_profiles",
+                },
+            )
+        return pd.DataFrame()
+    norms = np.linalg.norm(feats_np, axis=1)
+    if not np.isfinite(feats_np).all() or not np.isfinite(norms).all() or (norms <= 0).any():
+        raise ValueError("Cosine retrieval requires finite profiles with positive finite norms")
 
     # Strict vs_ref pairing rules.
     # Positives: same variant allele, both with REFERENCE_COL=-1, on
@@ -326,6 +416,7 @@ def _run_map(
     )
 
     # Compute mAP + p-values + BH FDR (variant cells only)
+    ap_scores["pool_row"] = np.arange(len(ap_scores))
     ap_variant = ap_scores[ap_scores[REFERENCE_COL] == -1]
 
     if test_split == "t4":
@@ -333,12 +424,25 @@ def _run_map(
         n_before, n_after = len(ap_variant), int(mask.sum())
         logger.info(
             "T4 filter (%s): %d → %d variant rows (%d alleles → %d)",
-            label, n_before, n_after,
+            label,
+            n_before,
+            n_after,
             ap_variant["Metadata_gene_allele"].nunique(),
             ap_variant.loc[mask, "Metadata_gene_allele"].nunique(),
         )
         ap_variant = ap_variant.loc[mask]
+    ap_variant = ap_variant.loc[query_mask.reindex(ap_variant.index)]
 
+    if trace is not None:
+        pl.from_pandas(ap_scores).write_parquet(trace / "average_precision.parquet")
+        pl.from_pandas(ap_variant).write_parquet(trace / "queries.parquet")
+    if ap_variant.empty:
+        if trace is not None:
+            save_json(trace / "status.json", {"status": "not_estimable", "reason": "no_query_profiles"})
+        return pd.DataFrame()
+    unsupported = (ap_variant["n_pos_pairs"] <= 0) | (ap_variant["n_total_pairs"] <= ap_variant["n_pos_pairs"])
+    if unsupported.any() or not np.isfinite(ap_variant["average_precision"]).all():
+        raise ValueError("Unsupported copairs queries: positive AND negative partners are required")
     map_scores = mean_average_precision(
         ap_variant,
         sameby=["Metadata_gene_allele"],
@@ -346,17 +450,22 @@ def _run_map(
         threshold=threshold,
         seed=seed,
         max_workers=max_workers,
+        cache_dir=trace / "null-cache" if trace is not None else None,
     )
+    if trace is not None:
+        save_json(trace / "status.json", {"status": "complete", "queries": len(ap_variant)})
 
     # Prefix columns with comparison label to avoid collisions on merge
-    map_scores = map_scores.rename(columns={
-        "mean_average_precision": f"mAP_{label}",
-        "mean_normalized_average_precision": f"mAP_{label}_norm",
-        "p_value": f"p_value_{label}",
-        "corrected_p_value": f"corrected_p_value_{label}",
-        "below_p": f"below_p_{label}",
-        "below_corrected_p": f"below_corrected_p_{label}",
-    })
+    map_scores = map_scores.rename(
+        columns={
+            "mean_average_precision": f"mAP_{label}",
+            "mean_normalized_average_precision": f"mAP_{label}_norm",
+            "p_value": f"p_value_{label}",
+            "corrected_p_value": f"corrected_p_value_{label}",
+            "below_p": f"below_p_{label}",
+            "below_corrected_p": f"below_corrected_p_{label}",
+        }
+    )
     map_scores = map_scores.drop(columns=["indices"], errors="ignore")
     return map_scores
 
@@ -384,34 +493,28 @@ def _compute_map_vs_ref(
     a degenerate value that contaminates the output.
     """
     unit_col = _resolve_well_col(df_full) if sample_level == "well" else _SAMPLE_UNIT_COL[sample_level]
-    var_df = df_full.filter(
-        pl.col("Metadata_gene_allele").is_in(alleles) &
-        (pl.col("Metadata_node_type") == "allele")
-    )
+    var_df = df_full.filter(pl.col("Metadata_gene_allele").is_in(alleles) & (pl.col("Metadata_node_type") == "allele"))
 
     # Pre-filter: drop variants whose gene has no disease_wt in this batch.
     ref_genes_in_batch = set(
-        df_full.filter(pl.col("Metadata_node_type") == "disease_wt")
-        ["Metadata_symbol"].unique().to_list()
+        df_full.filter(pl.col("Metadata_node_type") == "disease_wt")["Metadata_symbol"].unique().to_list()
     )
     candidate_genes = set(var_df["Metadata_symbol"].unique().to_list())
     paired_genes = candidate_genes & ref_genes_in_batch
     orphan_genes = sorted(candidate_genes - paired_genes)
     if orphan_genes:
-        n_dropped = (
-            var_df.filter(pl.col("Metadata_symbol").is_in(orphan_genes))
-            ["Metadata_gene_allele"].n_unique()
-        )
+        n_dropped = var_df.filter(pl.col("Metadata_symbol").is_in(orphan_genes))["Metadata_gene_allele"].n_unique()
         shown = orphan_genes if len(orphan_genes) <= 10 else orphan_genes[:10] + ["..."]
         logger.info(
             "Strict vs_ref: dropping %d allele(s) in %d orphan gene(s) [no same-batch disease_wt]: %s",
-            n_dropped, len(orphan_genes), shown,
+            n_dropped,
+            len(orphan_genes),
+            shown,
         )
     var_df = var_df.filter(pl.col("Metadata_symbol").is_in(list(paired_genes)))
     variant_genes = sorted(paired_genes)
     ref_df = df_full.filter(
-        (pl.col("Metadata_node_type") == "disease_wt") &
-        pl.col("Metadata_symbol").is_in(variant_genes)
+        (pl.col("Metadata_node_type") == "disease_wt") & pl.col("Metadata_symbol").is_in(variant_genes)
     )
 
     if var_df.is_empty() or ref_df.is_empty():
@@ -419,19 +522,17 @@ def _compute_map_vs_ref(
         return pl.DataFrame()
 
     if aggregate:
-        var_sampled = _aggregate_per_group(
-            var_df, ["Metadata_gene_allele", "Metadata_Plate", unit_col], feat_cols
-        )
-        ref_sampled = _aggregate_per_group(
-            ref_df, ["Metadata_symbol", "Metadata_Plate", unit_col], feat_cols
-        )
+        var_sampled = _aggregate_per_group(var_df, ["Metadata_gene_allele", "Metadata_Plate", unit_col], feat_cols)
+        ref_sampled = _aggregate_per_group(ref_df, ["Metadata_symbol", "Metadata_Plate", unit_col], feat_cols)
     else:
         var_sampled = _sample_per_site(
-            var_df, ["Metadata_gene_allele", "Metadata_Plate", unit_col],
+            var_df,
+            ["Metadata_gene_allele", "Metadata_Plate", unit_col],
             cells_per_site,
         )
         ref_sampled = _sample_per_site(
-            ref_df, ["Metadata_symbol", "Metadata_Plate", unit_col],
+            ref_df,
+            ["Metadata_symbol", "Metadata_Plate", unit_col],
             cells_per_site,
         )
     # Cap ref to neg_per_plate per plate — same subset used for all alleles.
@@ -443,16 +544,23 @@ def _compute_map_vs_ref(
     cap_str = f"{neg_per_plate}/plate cap" if neg_per_plate > 0 else "no cap"
     logger.info(
         "mAP_vs_ref: %d variant profiles (%d alleles) + %d reference profiles (%s) [%s]",
-        var_sampled.height, var_df["Metadata_gene_allele"].n_unique(),
-        ref_sampled.height, cap_str, mode,
+        var_sampled.height,
+        var_df["Metadata_gene_allele"].n_unique(),
+        ref_sampled.height,
+        cap_str,
+        mode,
     )
 
     pool = pl.concat([var_sampled, ref_sampled], how="diagonal")
     result = _run_map(
-        pool, feat_cols,
+        pool,
+        feat_cols,
         reference_condition="Metadata_node_type == 'disease_wt'",
-        null_size=null_size, threshold=threshold, seed=seed,
-        label="vs_ref", max_workers=max_workers,
+        null_size=null_size,
+        threshold=threshold,
+        seed=seed,
+        label="vs_ref",
+        max_workers=max_workers,
         neg_sameby=["Metadata_Plate", "Metadata_symbol"],
         test_split=test_split,
     )
@@ -473,9 +581,7 @@ def _ensure_well_position_col(df: pl.DataFrame) -> pl.DataFrame:
         return df
     if "Metadata_Well" in df.columns:
         return df.with_columns(Metadata_well_position=pl.col("Metadata_Well"))
-    raise ValueError(
-        "DataFrame missing both Metadata_well_position and Metadata_Well"
-    )
+    raise ValueError("DataFrame missing both Metadata_well_position and Metadata_Well")
 
 
 def _enumerate_loo_groups(
@@ -501,13 +607,14 @@ def _enumerate_loo_groups(
         )
         .agg(pl.len().alias("n"))
         .filter(pl.col("n") >= min_cells)
-        .sort("Metadata_gene_allele", "Metadata_plate_map_name", "Metadata_Control",
-              "Metadata_well_position")
+        .sort("Metadata_gene_allele", "Metadata_plate_map_name", "Metadata_Control", "Metadata_well_position")
         .collect()
     )
     groups: list[tuple[str, str, list[str], str]] = []
     for (allele, platemap, ctrl_type), grp in ctrl.group_by(
-        "Metadata_gene_allele", "Metadata_plate_map_name", "Metadata_Control",
+        "Metadata_gene_allele",
+        "Metadata_plate_map_name",
+        "Metadata_Control",
         maintain_order=True,
     ):
         wells = sorted(grp["Metadata_well_position"].to_list())
@@ -580,12 +687,12 @@ def _compute_control_null(
     n_runs_total = sum(len(wells) for _, _, wells, _ in groups) * len(channel_map)
     logger.info(
         "Control null (LOO): %d (allele × platemap) groups, %d total (well × channel) runs",
-        len(groups), n_runs_total,
+        len(groups),
+        n_runs_total,
     )
 
     rows: list[pl.DataFrame] = []
     skipped = 0
-    failed = 0
     for allele, platemap, wells, category in groups:
         for w_var in wells:
             w_refs = [w for w in wells if w != w_var]
@@ -594,24 +701,22 @@ def _compute_control_null(
                 skipped += 1
                 continue
             for ch_name, ch_feats in channel_map.items():
-                # A pseudo-variant well can become empty after a test_split
-                # (e.g. T4 dropped that well via QC), which trips an int-div
-                # in copairs. Catch per-(pair × channel) so one bad combo
-                # doesn't void the whole batch's thresholds.
-                try:
-                    ch_ctrl = _compute_map_vs_ref(
-                        pool, [loo_id], ch_feats,
-                        cells_per_site, neg_per_plate, sample_level, aggregate,
-                        null_size, threshold, seed, max_workers,
-                        test_split=test_split,
-                    )
-                except Exception as e:
-                    failed += 1
-                    logger.debug(
-                        "LOO control failed: %s/%s/%s/%s (%s) — skipping",
-                        allele, platemap, w_var, ch_name, e,
-                    )
-                    continue
+                # Empty query populations are explicit exclusions. Other failures
+                # must abort, including errors before _run_map creates a trace.
+                ch_ctrl = _compute_map_vs_ref(
+                    pool,
+                    [loo_id],
+                    ch_feats,
+                    cells_per_site,
+                    neg_per_plate,
+                    sample_level,
+                    aggregate,
+                    null_size,
+                    threshold,
+                    seed,
+                    max_workers,
+                    test_split=test_split,
+                )
                 if ch_ctrl.is_empty():
                     skipped += 1
                     continue
@@ -625,11 +730,8 @@ def _compute_control_null(
                         category=pl.lit(category),
                     )
                 )
-    if skipped or failed:
-        logger.info(
-            "Control null (LOO): skipped=%d (empty result), failed=%d (exception in copairs)",
-            skipped, failed,
-        )
+    if skipped:
+        logger.info("Control null (LOO): skipped=%d (empty result)", skipped)
     if not rows:
         return pl.DataFrame()
     return pl.concat(rows, how="diagonal")
@@ -652,6 +754,7 @@ def _plot_map_distributions(
     """
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
@@ -673,26 +776,31 @@ def _plot_map_distributions(
     bins = np.linspace(-0.4, 1.0, 40)
     q = null_percentile / 100.0
     for ax, ch in zip(axes, channels):
-        ctrl = (
-            control_results.filter(pl.col("channel") == ch)["mAP_vs_ref_norm"]
-            .drop_nulls().drop_nans().to_numpy()
-        )
-        exp = (
-            variant_results.filter(pl.col("channel") == ch)["mAP_vs_ref_norm"]
-            .drop_nulls().drop_nans().to_numpy()
+        ctrl = control_results.filter(pl.col("channel") == ch)["mAP_vs_ref_norm"].drop_nulls().drop_nans().to_numpy()
+        exp = variant_results.filter(pl.col("channel") == ch)["mAP_vs_ref_norm"].drop_nulls().drop_nans().to_numpy()
+        ax.hist(
+            ctrl,
+            bins=bins,
+            alpha=0.6,
+            density=True,
+            color="steelblue",
+            label=f"Control LOO (n={len(ctrl)})",
         )
         ax.hist(
-            ctrl, bins=bins, alpha=0.6, density=True,
-            color="steelblue", label=f"Control LOO (n={len(ctrl)})",
-        )
-        ax.hist(
-            exp, bins=bins, alpha=0.6, density=True,
-            color="coral", label=f"Exp+cPC (n={len(exp)})",
+            exp,
+            bins=bins,
+            alpha=0.6,
+            density=True,
+            color="coral",
+            label=f"Exp+cPC (n={len(exp)})",
         )
         if len(ctrl) > 0:
             thr = float(np.quantile(ctrl, q))
             ax.axvline(
-                thr, color="navy", linestyle="--", linewidth=1.5,
+                thr,
+                color="navy",
+                linestyle="--",
+                linewidth=1.5,
                 label=f"p{int(null_percentile)}={thr:.3f}",
             )
         ax.set_title(ch)
@@ -702,7 +810,8 @@ def _plot_map_distributions(
     axes[0].set_ylabel("Density")
     fig.suptitle(
         f"mAP_vs_ref_norm distribution — {representation} / {batch_id}",
-        fontsize=13, y=1.02,
+        fontsize=13,
+        y=1.02,
     )
     fig.tight_layout()
 
@@ -767,8 +876,7 @@ def _compute_map_hpa(
         return pl.DataFrame()
 
     ref_df = df_full.filter(
-        (pl.col("Metadata_node_type") == "disease_wt") &
-        pl.col("Metadata_symbol").is_in(list(gene_to_labels.keys()))
+        (pl.col("Metadata_node_type") == "disease_wt") & pl.col("Metadata_symbol").is_in(list(gene_to_labels.keys()))
     )
     if ref_df.is_empty():
         logger.warning("HPA: no reference cells matched HPA genes")
@@ -791,7 +899,10 @@ def _compute_map_hpa(
     n_genes = pool["Metadata_symbol"].n_unique()
     logger.info(
         "HPA: %d profiles from %d reference genes (threshold=%s, consensus=%s)",
-        pool.height, n_genes, hpa_threshold, hpa_consensus,
+        pool.height,
+        n_genes,
+        hpa_threshold,
+        hpa_consensus,
     )
 
     # Attach list-of-labels as a pandas object column (copairs multilabel expects lists)
@@ -835,14 +946,16 @@ def _compute_map_hpa(
         max_workers=max_workers,
         progress_bar=False,
     )
-    map_scores = map_scores.rename(columns={
-        "mean_average_precision": "mAP_hpa",
-        "mean_normalized_average_precision": "mAP_hpa_norm",
-        "p_value": "p_value_hpa",
-        "corrected_p_value": "corrected_p_value_hpa",
-        "below_p": "below_p_hpa",
-        "below_corrected_p": "below_corrected_p_hpa",
-    }).drop(columns=["indices"], errors="ignore")
+    map_scores = map_scores.rename(
+        columns={
+            "mean_average_precision": "mAP_hpa",
+            "mean_normalized_average_precision": "mAP_hpa_norm",
+            "p_value": "p_value_hpa",
+            "corrected_p_value": "corrected_p_value_hpa",
+            "below_p": "below_p_hpa",
+            "below_corrected_p": "below_corrected_p_hpa",
+        }
+    ).drop(columns=["indices"], errors="ignore")
 
     return pl.from_pandas(map_scores)
 
@@ -864,7 +977,7 @@ def run_phenotypic_activity(
     null_size: int = 10_000,
     threshold: float = 0.05,
     seed: int = 42,
-    max_workers: int | None = None,
+    max_workers: int | None = 1,
     cp_feature_file: str = "features",
     test_split: str | None = None,
     control_null: bool = True,
@@ -899,15 +1012,18 @@ def run_phenotypic_activity(
 
     if test_split is not None and layout != "single_rep":
         logger.error(
-            "T4 evaluation requires single_rep batch layout; %s is %s.",
-            batch_id, layout,
+            "T4 evaluation requires single_rep batch layout; %s is %s. "
+            "B11/B12 (multi_rep) are intentionally out of scope.",
+            batch_id,
+            layout,
         )
         sys.exit(1)
 
     if control_null and layout != "single_rep":
         logger.warning(
             "--control-null only supported on single_rep batches; %s is %s — disabling.",
-            batch_id, layout,
+            batch_id,
+            layout,
         )
         control_null = False
 
@@ -918,7 +1034,10 @@ def run_phenotypic_activity(
     logger.info("=" * 70)
     logger.info(
         "Phenotypic activity: batch=%s rep=%s layout=%s scope=%s %s neg_per_plate=%d",
-        batch_id, representation, layout, scope,
+        batch_id,
+        representation,
+        layout,
+        scope,
         f"aggregate=median/{sample_level}" if aggregate else f"cells_per_{sample_level}={cells_per_site}",
         neg_per_plate,
     )
@@ -931,7 +1050,9 @@ def run_phenotypic_activity(
     else:
         df_full = _load_dl(representation, batch_id)
 
-    df_full = _ensure_well_position_col(df_full)
+    df_full = identify_cells(
+        _ensure_well_position_col(df_full), batch_id, canonical=representation.startswith("subcell_allele_rybg_v2_")
+    ).sort(CELL_ID)
 
     all_cols = df_full.columns
     feat_cols = [c for c in all_cols if not c.startswith("Metadata_") and c != "_label"]
@@ -943,6 +1064,11 @@ def run_phenotypic_activity(
         logger.error("No alleles found after scope filter '%s'", scope)
         sys.exit(1)
     logger.info("%d alleles selected (scope='%s')", len(alleles), scope)
+    df_full.group_by(
+        "Metadata_gene_allele", "Metadata_symbol", "Metadata_node_type", "Metadata_Control"
+    ).len().with_columns(pl.col("Metadata_gene_allele").is_in(alleles).alias("selected_for_evaluation")).sort(
+        "Metadata_gene_allele"
+    ).write_parquet(output_dir / "allele_inventory.parquet")
 
     # ── Split features by channel ────────────────────────────────────
     channel_map = get_feature_channels(feat_cols, representation)
@@ -954,7 +1080,17 @@ def run_phenotypic_activity(
         logger.info("─── Channel: %s (%d features) ───", channel_name, len(ch_feats))
 
         ch_results = _compute_map_vs_ref(
-            df_full, alleles, ch_feats, cells_per_site, neg_per_plate, sample_level, aggregate, null_size, threshold, seed, max_workers,
+            df_full,
+            alleles,
+            ch_feats,
+            cells_per_site,
+            neg_per_plate,
+            sample_level,
+            aggregate,
+            null_size,
+            threshold,
+            seed,
+            max_workers,
             test_split=test_split,
         )
 
@@ -983,23 +1119,36 @@ def run_phenotypic_activity(
         sys.exit(1)
 
     results = pl.concat(all_channel_results, how="diagonal")
-    results = results.with_columns([
-        pl.lit(batch_id).alias("batch"),
-        pl.lit(representation).alias("representation"),
-    ])
+    save_json(
+        output_dir / "excluded_alleles.json",
+        [
+            {"allele": allele, "reason": "no_same_plate_reference_or_no_query_profiles"}
+            for allele in sorted(set(alleles) - set(results["Metadata_gene_allele"]))
+        ],
+    )
+    results = results.with_columns(
+        [
+            pl.lit(batch_id).alias("batch"),
+            pl.lit(representation).alias("representation"),
+        ]
+    )
 
     # ── Empirical control null (NC + PC, leave-one-out) ──────────────
     if control_null:
         logger.info("─── Control null (LOO NC+PC, p%d) ───", int(null_percentile))
-        try:
-            control_results = _compute_control_null(
-                df_full, channel_map,
-                cells_per_site, neg_per_plate, sample_level, aggregate,
-                ctrl_null_size, threshold, seed, max_workers, test_split,
-            )
-        except Exception as e:
-            logger.warning("Control null failed (%s) — skipping hit calls", e)
-            control_results = pl.DataFrame()
+        control_results = _compute_control_null(
+            df_full,
+            channel_map,
+            cells_per_site,
+            neg_per_plate,
+            sample_level,
+            aggregate,
+            ctrl_null_size,
+            threshold,
+            seed,
+            max_workers,
+            test_split,
+        )
 
         if control_results.is_empty():
             logger.warning("Control null: no mAP scores produced — skipping hit calls")
@@ -1008,27 +1157,19 @@ def run_phenotypic_activity(
                 is_hit=pl.lit(None, dtype=pl.Boolean),
             )
         else:
-            ctrl_p95 = (
-                control_results
-                .group_by("channel")
-                .agg(
-                    pl.col("mAP_vs_ref_norm")
-                      .quantile(null_percentile / 100.0, "linear")
-                      .alias("null_threshold_p95"),
-                    pl.col("mAP_vs_ref_norm").count().alias("n_control_pairs"),
-                )
+            ctrl_p95 = control_results.group_by("channel").agg(
+                pl.col("mAP_vs_ref_norm").quantile(null_percentile / 100.0, "linear").alias("null_threshold_p95"),
+                pl.col("mAP_vs_ref_norm").count().alias("n_control_pairs"),
             )
             for row in ctrl_p95.iter_rows(named=True):
                 logger.info(
                     "  %s null_threshold_p95=%.4f  n_control_pairs=%d",
-                    row["channel"], row["null_threshold_p95"], row["n_control_pairs"],
+                    row["channel"],
+                    row["null_threshold_p95"],
+                    row["n_control_pairs"],
                 )
-            results = (
-                results
-                .join(ctrl_p95.drop("n_control_pairs"), on="channel", how="left")
-                .with_columns(
-                    is_hit=(pl.col("mAP_vs_ref_norm") > pl.col("null_threshold_p95")),
-                )
+            results = results.join(ctrl_p95.drop("n_control_pairs"), on="channel", how="left").with_columns(
+                is_hit=(pl.col("mAP_vs_ref_norm") > pl.col("null_threshold_p95")),
             )
             ctrl_path = output_dir / "mAP_control.parquet"
             control_results.with_columns(
@@ -1036,18 +1177,26 @@ def run_phenotypic_activity(
                 representation=pl.lit(representation),
             ).write_parquet(str(ctrl_path))
             logger.info(
-                "Wrote %s: %d (LOO well × channel) rows", ctrl_path, control_results.height,
+                "Wrote %s: %d (LOO well × channel) rows",
+                ctrl_path,
+                control_results.height,
             )
             n_hit = int(results["is_hit"].cast(pl.Int8).sum() or 0)
             logger.info(
                 "Empirical hits (mAP_vs_ref_norm > p%d): %d / %d (alleles × channels)",
-                int(null_percentile), n_hit, results.height,
+                int(null_percentile),
+                n_hit,
+                results.height,
             )
 
             # Per-batch histogram: variant vs LOO control distribution by channel
             try:
                 _plot_map_distributions(
-                    results, control_results, output_dir, batch_id, representation,
+                    results,
+                    control_results,
+                    output_dir,
+                    batch_id,
+                    representation,
                     null_percentile,
                 )
             except Exception as e:
@@ -1062,13 +1211,21 @@ def run_phenotypic_activity(
 
     # ── HPA phenotypic consistency (reference genes only) ────────────
     if hpa:
-        logger.info("─── HPA consistency (threshold=%.1f, consensus=%s) ───",
-                    hpa_threshold, hpa_consensus)
+        logger.info("─── HPA consistency (threshold=%.1f, consensus=%s) ───", hpa_threshold, hpa_consensus)
         hpa_channel_results: list[pl.DataFrame] = []
         for channel_name, ch_feats in channel_map.items():
             map_hpa = _compute_map_hpa(
-                df_full, ch_feats, cells_per_site, sample_level, aggregate,
-                hpa_threshold, hpa_consensus, null_size, threshold, seed, max_workers,
+                df_full,
+                ch_feats,
+                cells_per_site,
+                sample_level,
+                aggregate,
+                hpa_threshold,
+                hpa_consensus,
+                null_size,
+                threshold,
+                seed,
+                max_workers,
             )
             if map_hpa.is_empty():
                 continue
@@ -1085,17 +1242,21 @@ def run_phenotypic_activity(
             hpa_channel_results.append(map_hpa)
 
         if hpa_channel_results:
-            hpa_results = pl.concat(hpa_channel_results, how="diagonal").with_columns([
-                pl.lit(batch_id).alias("batch"),
-                pl.lit(representation).alias("representation"),
-                pl.lit(hpa_threshold).alias("hpa_threshold"),
-                pl.lit(hpa_consensus).alias("hpa_consensus"),
-            ])
+            hpa_results = pl.concat(hpa_channel_results, how="diagonal").with_columns(
+                [
+                    pl.lit(batch_id).alias("batch"),
+                    pl.lit(representation).alias("representation"),
+                    pl.lit(hpa_threshold).alias("hpa_threshold"),
+                    pl.lit(hpa_consensus).alias("hpa_consensus"),
+                ]
+            )
             hpa_path = output_dir / f"hpa_consistency_t{hpa_threshold}_{hpa_consensus}.parquet"
             hpa_results.write_parquet(str(hpa_path))
             logger.info(
                 "Wrote %s: %d genes × %d channels",
-                hpa_path, hpa_results["Metadata_symbol"].n_unique(), hpa_results["channel"].n_unique(),
+                hpa_path,
+                hpa_results["Metadata_symbol"].n_unique(),
+                hpa_results["channel"].n_unique(),
             )
 
     elapsed = time.time() - t0
@@ -1105,9 +1266,7 @@ def run_phenotypic_activity(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Phenotypic activity assessment using copairs mAP (single-cell)."
-    )
+    parser = argparse.ArgumentParser(description="Phenotypic activity assessment using copairs mAP (single-cell).")
     parser.add_argument(
         "--batch",
         required=True,
@@ -1195,8 +1354,8 @@ def main() -> None:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=None,
-        help="Number of threads for p-value computation (default: all available)",
+        default=1,
+        help="Bound similarity, null-generation and p-value workers (default: 1)",
     )
     parser.add_argument(
         "--cp-feature-file",
@@ -1253,11 +1412,34 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    require_bounded_execution(args.representation)
 
     test_split = None if args.test_split == "none" else args.test_split
     rep_suffix = f"_{test_split}" if test_split else ""
     output_dir = PHENOTYPIC_ACTIVITY_DIR / f"{args.representation}{rep_suffix}" / args.batch
-    try:
+    raw_input = INTERIM_DIR / args.representation / args.batch / REP_FEATURE_FILES[args.representation]
+    if args.representation == "cellprofiler":
+        raw_input = CELLPROFILER_DIR / args.batch / f"{args.cp_feature_file}.parquet"
+    parent = require_stage(raw_input.parent, raw_input.name, representation=args.representation, batch=args.batch)
+    if args.representation.startswith("subcell_allele_rybg_v2_") and (
+        test_split != "t4" or not args.control_null or args.hpa
+    ):
+        raise ValueError("New SubCell campaign requires T4 reporting and control calibration; HPA is separate")
+    global _TRACE_DIR
+    _TRACE_DIR = output_dir / "trace"
+    parameters = {
+        **vars(args),
+        "seed": 42,
+        "similarity_batch_size": 20000,
+        "empirical_quantile_interpolation": "linear",
+        "hit_rule": "strict_p95_only",
+        "query_rule": "T4_only" if test_split == "t4" else "all",
+        "comparison_pool": "full",
+        "missing_reference_policy": "skip_variant_plate_queries",
+        "cache_policy": "isolated_per_map_call",
+        "blas_threads": 1,
+    }
+    with stage(output_dir, [raw_input], parameters, parents=[parent]) as run, bounded_copairs(args.max_workers):
         run_phenotypic_activity(
             batch_id=args.batch,
             representation=args.representation,
@@ -1278,9 +1460,46 @@ def main() -> None:
             null_percentile=args.null_percentile,
             ctrl_null_size=args.ctrl_null_size,
         )
-    finally:
-        if output_dir.exists():
-            record(output_dirs=[output_dir])
+        results = pl.read_parquet(output_dir / "mAP_results.parquet")
+        if args.control_null:
+            if not (output_dir / "mAP_control.parquet").is_file():
+                raise ValueError("Missing required copairs control calibration")
+            controls = pl.read_parquet(output_dir / "mAP_control.parquet")
+            if controls.is_empty() or not controls["mAP_vs_ref_norm"].is_finite().fill_null(False).all():
+                raise ValueError("Missing/invalid copairs control scores")
+            if (
+                results.is_empty()
+                or not results.select(
+                    pl.all_horizontal(
+                        pl.col("mAP_vs_ref_norm", "null_threshold_p95").is_finite().fill_null(False),
+                        pl.col("is_hit").is_not_null(),
+                    ).all()
+                ).item()
+            ):
+                raise ValueError("Missing/invalid copairs control calibration or results")
+            thresholds = controls.group_by("channel").agg(
+                pl.col("mAP_vs_ref_norm").quantile(args.null_percentile / 100, "linear").alias("expected")
+            )
+            checked = results.join(thresholds, on="channel", how="left")
+            if not checked.select(
+                (
+                    (pl.col("null_threshold_p95") == pl.col("expected"))
+                    & (pl.col("is_hit") == (pl.col("mAP_vs_ref_norm") > pl.col("expected")))
+                )
+                .fill_null(False)
+                .all()
+            ).item():
+                raise ValueError("Copairs hit/threshold mismatch")
+        results.with_columns(pl.lit(run["stage_id"]).alias("analysis_stage_id")).write_parquet(
+            output_dir / "mAP_results.parquet"
+        )
+        if args.control_null:
+            controls.with_columns(pl.lit(run["stage_id"]).alias("analysis_stage_id")).write_parquet(
+                output_dir / "mAP_control.parquet"
+            )
+        for call in sorted(_TRACE_DIR.iterdir()):
+            if not (call / "status.json").exists():
+                raise ValueError(f"Failed copairs call cannot be silently omitted: {call}")
 
 
 if __name__ == "__main__":
