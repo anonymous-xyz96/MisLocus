@@ -128,8 +128,9 @@ def extract(root, output):
                     raise ValueError(f'Truncated extraction: {destination}')
                 files[str(destination.relative_to(output))] = {
                     'sha256': digest.hexdigest(), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
+    # The ledger indexes attempts; only the last-written receipt marks completion.
+    record([output], input_paths=archives, duration_seconds=time.perf_counter() - started)
     # No model eligibility or normalization decisions are made by this receipt.
     save_json(output / 'extraction.json', {'release': inventory, 'files': files,
-              'invocation': invocation(), 'runtime': {'python': platform.python_version(), 'platform': platform.platform()},
+              'invocation': invocation(output), 'runtime': {'python': platform.python_version(), 'platform': platform.platform()},
               'source_archive_sha256': sha256(output / 'source.tar.gz')})
-    record([output], input_paths=archives, duration_seconds=time.perf_counter() - started)
