@@ -8,9 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import polars as pl
+from test_downstream_safeguards import load_script
 
 from prot_loc_benchmark import provenance, stages
 from prot_loc_benchmark.classification.metrics import load_single_fold_metrics
+from prot_loc_benchmark.config import REPO_ROOT
 
 
 class ReviewRegressions(unittest.TestCase):
@@ -31,6 +33,108 @@ class ReviewRegressions(unittest.TestCase):
                     with stages.stage(root / "child", [parent / "features"], {}, parents=[receipt]):
                         pass
                 self.assertFalse((root / "child/stage.json").exists())
+
+    def test_cellprofiler_pa_entrypoint_reaches_the_correct_parent_gate(self):
+        pa = load_script(REPO_ROOT / "scripts/09c_classify_PA.py", "review_pa_cp")
+        batch = "2025_03_17_Batch_15"
+        for source in ("normalized", "features"):
+            with (
+                patch(
+                    "sys.argv",
+                    ["09c", "--batch", batch, "--representation", "cellprofiler", "--cp-feature-file", source],
+                ),
+                patch.object(pa, "require_stage", side_effect=RuntimeError("parent gate")) as gate,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "parent gate"):
+                    pa.main()
+                gate.assert_called_once_with(
+                    pa.CELLPROFILER_DIR / batch, f"{source}.parquet", representation="cellprofiler", batch=batch
+                )
+
+    def test_copairs_pre_trace_control_failure_is_not_silently_skipped(self):
+        pa = load_script(REPO_ROOT / "scripts/09c_classify_PA.py", "review_pa_controls")
+        rows = [
+            dict(
+                Metadata_gene_allele="C",
+                Metadata_symbol="C",
+                Metadata_Plate=f"P_T{t}",
+                Metadata_plate_map_name="P",
+                Metadata_well_position=w,
+                Metadata_Well=w,
+                Metadata_Control="NC",
+                Metadata_node_type="NC",
+                f=1.0,
+            )
+            for t in range(1, 5)
+            for w in ["A01", "A02", "A03"]
+        ]
+        calls = 0
+
+        def fail_before_trace(pool, alleles, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("injected pre-trace failure")
+            return pl.DataFrame({"Metadata_gene_allele": alleles, "mAP_vs_ref_norm": [0.4]})
+
+        with patch.object(pa, "_compute_map_vs_ref", side_effect=fail_before_trace):
+            with self.assertRaisesRegex(RuntimeError, "pre-trace failure"):
+                pa._compute_control_null(
+                    pl.DataFrame(rows), {"EMBED": ["f"]}, 20, 0, "site", True, 32, 0.05, 42, 1, "t4", min_cells=1
+                )
+
+    def test_zero_norm_profiles_cannot_produce_finite_but_meaningless_ap(self):
+        pa = load_script(REPO_ROOT / "scripts/09c_classify_PA.py", "review_pa_zero")
+        rows = [
+            dict(
+                Metadata_gene_allele=allele,
+                Metadata_node_type=node,
+                Metadata_symbol="G",
+                Metadata_Plate=f"P_T{t}",
+                f=0.0,
+                g=0.0,
+            )
+            for t in range(1, 5)
+            for allele, node in [("G", "disease_wt"), ("G_v", "allele")]
+        ]
+        with self.assertRaisesRegex(ValueError, "norm|cosine"):
+            pa._run_map(
+                pl.DataFrame(rows),
+                ["f", "g"],
+                "Metadata_node_type == 'disease_wt'",
+                32,
+                0.05,
+                42,
+                "vs_ref",
+                max_workers=1,
+                neg_sameby=["Metadata_Plate", "Metadata_symbol"],
+                test_split="t4",
+            )
+
+    def test_empty_t4_queries_are_explicitly_not_estimable_before_pairing(self):
+        pa = load_script(REPO_ROOT / "scripts/09c_classify_PA.py", "review_pa_empty")
+        frame = pl.DataFrame(
+            {
+                "Metadata_gene_allele": ["G", "G_v"],
+                "Metadata_node_type": ["disease_wt", "allele"],
+                "Metadata_symbol": ["G", "G"],
+                "Metadata_Plate": ["P_T1", "P_T1"],
+                "f": [1.0, 2.0],
+            }
+        )
+        with patch.object(pa, "average_precision", side_effect=AssertionError("No pairing without queries")):
+            result = pa._run_map(
+                frame,
+                ["f"],
+                "Metadata_node_type == 'disease_wt'",
+                32,
+                0.05,
+                42,
+                "vs_ref",
+                max_workers=1,
+                test_split="t4",
+            )
+        self.assertTrue(result.empty)
 
     def test_new_t4_controls_only_run_cannot_fall_back_to_legacy_or_empty_metrics(self):
         with tempfile.TemporaryDirectory() as directory:

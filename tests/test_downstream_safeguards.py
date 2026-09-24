@@ -4,15 +4,19 @@ import importlib.util
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import polars as pl
 
 from prot_loc_benchmark import provenance, stages
 from prot_loc_benchmark.classification.train import allocated_gpu, select_device, train_and_predict
+from prot_loc_benchmark.copairs_runtime import bounded_copairs
 from prot_loc_benchmark.downstream_inputs import verify_export
 from prot_loc_benchmark.identity import CELL_ID, identify_cells, ordered_id_hash
 from prot_loc_benchmark.provenance import capture_source, code_fingerprint, save_json, sha256
@@ -191,6 +195,41 @@ class Safeguards(unittest.TestCase):
             limits["cpu.max"] = "6500000 100000"
             with self.assertRaisesRegex(ValueError, "ceilings"):
                 stages.require_bounded_execution("subcell_allele_rybg_v2_mae_s42")
+
+    def test_all_copairs_pools_are_bounded_without_changing_results(self):
+        from copairs import compute
+
+        lock = threading.Lock()
+        active = peak = 0
+
+        def work(_):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(active, peak)
+            time.sleep(0.005)
+            with lock:
+                active -= 1
+
+        original = compute.ThreadPool
+        with bounded_copairs(2):
+            compute.parallel_map(work, np.arange(24), progress_bar=False)
+        self.assertLessEqual(peak, 2)
+        self.assertIs(compute.ThreadPool, original)
+        with tempfile.TemporaryDirectory() as directory:
+            arrays = []
+            for workers in (1, 2):
+                with bounded_copairs(workers):
+                    arrays.append(
+                        compute.get_null_dists(
+                            np.array([[2, 8], [3, 9]]),
+                            32,
+                            seed=42,
+                            cache_dir=Path(directory) / str(workers),
+                            progress_bar=False,
+                        )
+                    )
+            np.testing.assert_array_equal(*arrays)
 
     def test_verified_export_contract_rejects_partial_wrong_checkpoint_and_tampering(self):
         # A small producer-shaped fixture, not a trusted substitute for production verification.
