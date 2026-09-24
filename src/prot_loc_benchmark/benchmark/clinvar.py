@@ -62,6 +62,8 @@ def load_metrics(
 
     frames = []
     for rep in representations:
+        if rep.startswith("subcell_allele_rybg_v2_") and fold_mode != "t4-only":
+            raise ValueError("New SubCell classifier outputs require --fold-mode t4-only")
         channels = benchmark_channels[rep]
         for pair_name, (batch_a, batch_b) in biorep_pairs.items():
             for batch in (batch_a, batch_b):
@@ -72,9 +74,7 @@ def load_metrics(
                         continue
                     df = pl.read_csv(path)
                 else:
-                    df = load_single_fold_metrics(
-                        rep, batch, test_plate_suffix=test_plate_suffix
-                    )
+                    df = load_single_fold_metrics(rep, batch, test_plate_suffix=test_plate_suffix)
                     if df.is_empty():
                         continue
 
@@ -90,14 +90,14 @@ def load_metrics(
                 frames.append(df)
                 log.info(
                     "Loaded %s/%s [%s]: %d alleles × %d channels",
-                    rep, batch, fold_mode,
+                    rep,
+                    batch,
+                    fold_mode,
                     df["allele_var"].n_unique(),
                     df["channel"].n_unique(),
                 )
     if not frames:
-        raise ValueError(
-            f"No metrics found for representations={representations} (fold_mode={fold_mode})"
-        )
+        raise ValueError(f"No metrics found for representations={representations} (fold_mode={fold_mode})")
     return pl.concat(frames)
 
 
@@ -167,7 +167,9 @@ def join_clinvar(averaged: pl.DataFrame, clinvar: pl.DataFrame) -> pl.DataFrame:
     n_after = annotated["allele_var"].n_unique()
     log.info(
         "ClinVar join: %d → %d alleles (%d dropped, no annotation)",
-        n_before, n_after, n_before - n_after,
+        n_before,
+        n_after,
+        n_before - n_after,
     )
     return annotated
 
@@ -196,17 +198,21 @@ def run_wilcoxon_tests(data: pl.DataFrame) -> pl.DataFrame:
                 ("Pathogenic_vs_Benign", "clinvar_clnsig_clean", "Pathogenic", "Benign"),
                 ("Pathogenic_vs_Benign_strict", "clinvar_clnsig_clean_pp_strict", "Pathogenic", "Benign"),
             ]:
-                vals_a = ch_data.filter(
-                    (pl.col(col) == group_a) & pl.col("auroc_avg").is_not_nan()
-                )["auroc_avg"].to_numpy()
-                vals_b = ch_data.filter(
-                    (pl.col(col) == group_b) & pl.col("auroc_avg").is_not_nan()
-                )["auroc_avg"].to_numpy()
+                vals_a = ch_data.filter((pl.col(col) == group_a) & pl.col("auroc_avg").is_not_nan())[
+                    "auroc_avg"
+                ].to_numpy()
+                vals_b = ch_data.filter((pl.col(col) == group_b) & pl.col("auroc_avg").is_not_nan())[
+                    "auroc_avg"
+                ].to_numpy()
 
                 if len(vals_a) < 2 or len(vals_b) < 2:
                     log.warning(
                         "Skipping %s/%s/%s: n=%d vs n=%d",
-                        rep, channel, comparison, len(vals_a), len(vals_b),
+                        rep,
+                        channel,
+                        comparison,
+                        len(vals_a),
+                        len(vals_b),
                     )
                     continue
 

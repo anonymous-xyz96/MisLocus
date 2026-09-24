@@ -1,5 +1,8 @@
 """Controls-first T4 contract; tiny CPU fixtures, never production inputs."""
 
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,9 +14,11 @@ from prot_loc_benchmark.classification.cv import generate_folds, split_fold
 from prot_loc_benchmark.classification.metrics import (
     aggregate_allele_metrics,
     compute_null_threshold,
+    load_single_fold_metrics,
 )
 from prot_loc_benchmark.classification.pairs import build_control_pairs, get_pair_data
 from prot_loc_benchmark.classification.reporting import plot_auroc_distributions
+from prot_loc_benchmark.config import REPO_ROOT
 
 
 class CalibrationChecks(unittest.TestCase):
@@ -88,6 +93,65 @@ class CalibrationChecks(unittest.TestCase):
             plot_auroc_distributions(metrics, metrics, Path(directory), "fixture", {"EMBED": 0.83})
             self.assertEqual(line.call_args.args[0], 0.83)
             self.assertTrue((Path(directory) / "auroc_distribution.png").exists())
+
+
+class DownstreamCLIChecks(unittest.TestCase):
+    def test_imported_t4_summarizer_uses_only_t4_control_scores(self):
+        batch, rep = "2024_01_23_Batch_7", "fixture"
+        rows = [
+            dict(
+                classifier_id=f"c{i}",
+                pair_id=f"p{i}",
+                gene="G",
+                allele_var="G_v",
+                channel="EMBED",
+                category=category,
+                imbalance_ratio=1.0,
+                auroc=score,
+                auprc=score,
+                balanced_accuracy=score,
+            )
+            for i, (category, score) in enumerate([("NC", 1.0), ("PC", 0.6), ("PC", 0.9), ("Exp", 0.8)])
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            src = root / "processed/classification" / rep / batch
+            src.mkdir(parents=True)
+            pl.DataFrame(rows).write_csv(src / "metrics.csv")
+            pl.DataFrame(
+                {"classifier_id": ["c0", "c1", "c2", "c3"], "test_plates": ["P_T3", "P_T4", "P_T4", "P_T4"]}
+            ).write_csv(src / "classifier_info.csv")
+            classification_root = root / "processed/classification"
+            info = pl.read_csv(src / "classifier_info.csv")
+            clean = load_single_fold_metrics(rep, batch, classification_dir=classification_root)
+            self.assertEqual(clean["null_threshold"].to_list(), [0.9])
+            for invalid in (info.head(3), pl.concat([info, info.head(1)])):
+                invalid.write_csv(src / "classifier_info.csv")
+                with self.assertRaisesRegex(ValueError, "classifier"):
+                    load_single_fold_metrics(rep, batch, classification_dir=classification_root)
+            info.write_csv(src / "classifier_info.csv")
+            pl.DataFrame(rows + [rows[-1]]).write_csv(src / "metrics.csv")
+            with self.assertRaisesRegex(ValueError, "classifier"):
+                load_single_fold_metrics(rep, batch, classification_dir=classification_root)
+            pl.DataFrame(rows).write_csv(src / "metrics.csv")
+            env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "MISLOCUS_DATA_ROOT": str(root)}
+            command = [
+                sys.executable,
+                str(REPO_ROOT / "scripts/09e_summarize_t4.py"),
+                "--representation",
+                rep,
+                "--batches",
+                batch,
+            ]
+            result = subprocess.run(command, env=env, cwd=root, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            out = root / "processed/classification" / f"{rep}_t4" / batch
+            summary = pl.read_csv(out / "metrics_summary.csv")
+            self.assertEqual(summary["null_threshold"].to_list(), [0.9])
+            self.assertEqual(summary["is_hit"].to_list(), [False])
+            self.assertEqual(summary["auroc_std"].null_count(), 1)
+            repeat = subprocess.run(command, env=env, cwd=root, capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(repeat.returncode, 0)
 
 
 if __name__ == "__main__":

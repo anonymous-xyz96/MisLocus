@@ -18,6 +18,7 @@ encoder-unseen evaluation that mirrors the DL train/val/test split.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 
@@ -37,7 +38,6 @@ from prot_loc_benchmark.config import (
     CLINVAR_BENCHMARK_DIR,
     CLINVAR_SINGLE_FOLD_DIR,
 )
-
 from prot_loc_benchmark.viz.benchmark import (
     plot_clinvar_violin,
     plot_summary_heatmap,
@@ -55,6 +55,7 @@ log = logging.getLogger(__name__)
 def load_pa_metrics(
     representations: list[str],
     biorep_pairs: dict[str, tuple[str, str]],
+    fold_mode: str = "full",
 ) -> pl.DataFrame:
     """Load mAP_results.parquet from classification_PA for all reps and batch pairs.
 
@@ -62,11 +63,25 @@ def load_pa_metrics(
     the long format expected by average_across_bioreps. mAP_vs_NC is ignored
     if present (legacy column).
     """
+    if fold_mode not in ("full", "t4-only"):
+        raise ValueError(f"Unknown fold mode: {fold_mode}")
+    from prot_loc_benchmark.stages import require_stage
+
     frames = []
     for rep in representations:
+        if rep.startswith("subcell_allele_rybg_v2_") and fold_mode != "t4-only":
+            raise ValueError("New SubCell PA outputs require --fold-mode t4-only")
         for pair_name, (batch_a, batch_b) in biorep_pairs.items():
             for batch in (batch_a, batch_b):
-                path = CLASSIFICATION_PA_DIR / rep / batch / "mAP_results.parquet"
+                output_rep = f"{rep}_t4" if fold_mode == "t4-only" else rep
+                path = CLASSIFICATION_PA_DIR / output_rep / batch / "mAP_results.parquet"
+                if fold_mode == "t4-only" or (path.parent / "started.json").exists():
+                    receipt = require_stage(path.parent, path.name, representation=rep, batch=batch)
+                    if (
+                        fold_mode == "t4-only"
+                        and json.loads(receipt.read_text())["parameters"].get("test_split") != "t4"
+                    ):
+                        raise ValueError(f"Completed PA stage is not the requested T4-query protocol: {path.parent}")
                 if not path.exists():
                     log.warning("Missing PA: %s", path)
                     continue
@@ -78,25 +93,25 @@ def load_pa_metrics(
                     norm_col = f"mAP_{label}_norm"
                     if norm_col not in df.columns:
                         continue
-                    channel_expr = (
-                        (pl.col("channel") + "_" + pl.lit(label))
-                        if has_channel
-                        else pl.lit(f"mAP_{label}")
-                    )
-                    sub = df.select([
-                        pl.col("Metadata_gene_allele").alias("allele_var"),
-                        pl.col("Metadata_gene_allele").str.split("_").list.first().alias("gene"),
-                        pl.col(norm_col).alias("auroc_mean"),
-                        pl.lit(0.0).alias("auroc_std"),
-                        pl.lit(0.0).alias("auprc_mean"),
-                        channel_expr.alias("channel"),
-                        pl.lit(rep).alias("representation"),
-                        pl.lit(pair_name).alias("pair_name"),
-                        pl.lit(batch).alias("batch"),
-                    ]).drop_nulls(subset=["auroc_mean"])
+                    channel_expr = (pl.col("channel") + "_" + pl.lit(label)) if has_channel else pl.lit(f"mAP_{label}")
+                    sub = df.select(
+                        [
+                            pl.col("Metadata_gene_allele").alias("allele_var"),
+                            pl.col("Metadata_gene_allele").str.split("_").list.first().alias("gene"),
+                            pl.col(norm_col).alias("auroc_mean"),
+                            pl.lit(None, dtype=pl.Float64).alias("auroc_std"),
+                            pl.lit(None, dtype=pl.Float64).alias("auprc_mean"),
+                            channel_expr.alias("channel"),
+                            pl.lit(rep).alias("representation"),
+                            pl.lit(pair_name).alias("pair_name"),
+                            pl.lit(batch).alias("batch"),
+                        ]
+                    ).drop_nulls(subset=["auroc_mean"])
                     frames.append(sub)
                 n_ch = df["channel"].n_unique() if has_channel else 1
-                log.info("Loaded PA %s/%s: %d alleles × %d channels", rep, batch, df["Metadata_gene_allele"].n_unique(), n_ch)
+                log.info(
+                    "Loaded PA %s/%s: %d alleles × %d channels", rep, batch, df["Metadata_gene_allele"].n_unique(), n_ch
+                )
 
     if not frames:
         raise ValueError("No PA metrics found for the given representations/batches")
@@ -109,9 +124,7 @@ def load_pa_metrics(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Benchmark ClinVar pathogenic vs benign AUROC comparison."
-    )
+    parser = argparse.ArgumentParser(description="Benchmark ClinVar pathogenic vs benign AUROC comparison.")
     parser.add_argument(
         "--representations",
         nargs="+",
@@ -147,7 +160,7 @@ def main() -> None:
             "full: 4-fold mean from metrics_summary.csv (original behavior). "
             "t4-only: re-derive single-fold AUROC from metrics.csv where the "
             "held-out plate ends with T4, giving a clean train=T1+T2+T3 / "
-            "test=T4 evaluation. Ignored if --pa is set."
+            "test=T4 evaluation. With --pa, reads completed T4-query copairs outputs."
         ),
     )
     args = parser.parse_args()
@@ -160,7 +173,13 @@ def main() -> None:
 
     if args.output_dir:
         output_dir = args.output_dir
-    elif args.fold_mode == "t4-only" and not args.pa:
+    elif args.pa:
+        output_dir = (
+            CLINVAR_BENCHMARK_DIR.parent.parent
+            / "clinvar_PA"
+            / ("single_fold" if args.fold_mode == "t4-only" else "full_dataset")
+        )
+    elif args.fold_mode == "t4-only":
         output_dir = CLINVAR_SINGLE_FOLD_DIR
     else:
         output_dir = CLINVAR_BENCHMARK_DIR
@@ -169,11 +188,13 @@ def main() -> None:
     # Step 1: Load metrics
     if args.pa:
         log.info("Loading phenotypic activity (mAP) metrics...")
-        metrics = load_pa_metrics(args.representations, BIOREP_PAIRS)
+        metrics = load_pa_metrics(args.representations, BIOREP_PAIRS, fold_mode=args.fold_mode)
     else:
         log.info("Loading classification metrics (fold_mode=%s)...", args.fold_mode)
         metrics = load_metrics(
-            args.representations, BIOREP_PAIRS, BENCHMARK_CHANNELS,
+            args.representations,
+            BIOREP_PAIRS,
+            BENCHMARK_CHANNELS,
             fold_mode=args.fold_mode,
         )
 
@@ -218,9 +239,13 @@ def main() -> None:
             ("clinvar_clnsig_clean_pp_strict", "clinvar_clnsig_clean_pp_strict", "clinvar_clnsig_clean_pp_strict"),
         ]:
             plot_clinvar_violin(
-                annotated, clinvar_col,
-                CLINVAR_PALETTE[palette_key], CLINVAR_ORDER[order_key],
-                rep, rep_dir, stat_results,
+                annotated,
+                clinvar_col,
+                CLINVAR_PALETTE[palette_key],
+                CLINVAR_ORDER[order_key],
+                rep,
+                rep_dir,
+                stat_results,
                 **violin_kwargs,
             )
 
@@ -236,6 +261,7 @@ def main() -> None:
     log.info("Done. Outputs in %s", output_dir)
 
     from prot_loc_benchmark.provenance import record
+
     prov_dirs = [output_dir / rep / "summary" for rep in args.representations]
     record(output_dirs=prov_dirs)
 

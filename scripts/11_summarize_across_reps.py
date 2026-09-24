@@ -54,8 +54,7 @@ def load_per_rep_summaries(
     for rep in representations:
         summary_dir = dataset_dir / rep / "summary"
         if not summary_dir.exists():
-            log.warning("No summary dir for %s, skipping", rep)
-            continue
+            raise FileNotFoundError(f"Missing requested representation summary: {summary_dir}")
 
         for fname, frames in [
             ("averaged_metrics.csv", avg_frames),
@@ -64,9 +63,11 @@ def load_per_rep_summaries(
         ]:
             path = summary_dir / fname
             if not path.exists():
-                log.warning("Missing %s for %s", fname, rep)
-                continue
-            df = pl.read_csv(path)
+                raise FileNotFoundError(f"Missing requested summary artifact: {path}")
+            overrides = (
+                {"auroc_std_avg": pl.Float64, "auprc_avg": pl.Float64} if fname != "wilcoxon_results.csv" else {}
+            )
+            df = pl.read_csv(path, schema_overrides=overrides)
             # Empty CSVs (zero data rows) cause polars to infer every column
             # as String; concatenating them with populated frames raises
             # SchemaError. Skip them — typically a rep that was registered
@@ -85,9 +86,7 @@ def load_per_rep_summaries(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Aggregate per-rep ClinVar benchmarks into cross-rep summary."
-    )
+    parser = argparse.ArgumentParser(description="Aggregate per-rep ClinVar benchmarks into cross-rep summary.")
     parser.add_argument(
         "--dataset-dir",
         type=Path,
@@ -137,7 +136,8 @@ def main() -> None:
     if len(representations) < 2:
         log.error(
             "Need ≥2 representations for cross-rep summary, found %d: %s",
-            len(representations), representations,
+            len(representations),
+            representations,
         )
         sys.exit(1)
     log.info("Representations: %s", representations)
@@ -146,7 +146,9 @@ def main() -> None:
     averaged, annotated, stat_results = load_per_rep_summaries(dataset_dir, representations)
     log.info(
         "Loaded: %d averaged rows, %d annotated rows, %d stat rows",
-        len(averaged), len(annotated), len(stat_results),
+        len(averaged),
+        len(annotated),
+        len(stat_results),
     )
 
     # Write cross-rep outputs
@@ -173,12 +175,10 @@ def main() -> None:
             predictor_key = "clinvar"
     cfg = PREDICTORS[predictor_key]
     score_label = "norm-mAP" if is_pa else "AUROC"
-    heatmap_title = (
-        f"{cfg.title} benchmark — {cfg.tests[0].group_a} vs "
-        f"{cfg.tests[0].group_b} {score_label}"
-    )
+    heatmap_title = f"{cfg.title} benchmark — {cfg.tests[0].group_a} vs {cfg.tests[0].group_b} {score_label}"
     plot_summary_heatmap(
-        stat_results, cross_dir,
+        stat_results,
+        cross_dir,
         rep_order=representations,
         stat="mean" if is_pa else "median",
         title=heatmap_title,
@@ -193,9 +193,10 @@ def main() -> None:
         legacy_col = "clinvar_clnsig_clean"
         if legacy_col in annotated.columns:
             log.info(
-                "Predictor %s expects column %s but only %s is present — "
-                "using legacy column for correlation plots.",
-                predictor_key, label_col, legacy_col,
+                "Predictor %s expects column %s but only %s is present — using legacy column for correlation plots.",
+                predictor_key,
+                label_col,
+                legacy_col,
             )
             label_col = legacy_col
     palette = cfg.palette[cfg.label_col]
@@ -222,8 +223,10 @@ def main() -> None:
         if "cytoself" in reps_set:
             plot_auroc_correlation(
                 annotated,
-                rep_a=anchor_rep, channel_a="GFP" + pa_suffix,
-                rep_b="cytoself", channel_b="combined" + pa_suffix,
+                rep_a=anchor_rep,
+                channel_a="GFP" + pa_suffix,
+                rep_b="cytoself",
+                channel_b="combined" + pa_suffix,
                 output_dir=cross_dir,
                 label_alleles=label_alleles,
                 **correlation_kwargs,
@@ -234,8 +237,10 @@ def main() -> None:
             if rep.startswith("subcell_portable_"):
                 plot_auroc_correlation(
                     annotated,
-                    rep_a=anchor_rep, channel_a="GFP" + pa_suffix,
-                    rep_b=rep, channel_b="EMBED" + pa_suffix,
+                    rep_a=anchor_rep,
+                    channel_a="GFP" + pa_suffix,
+                    rep_b=rep,
+                    channel_b="EMBED" + pa_suffix,
                     output_dir=cross_dir,
                     label_alleles=label_alleles,
                     **correlation_kwargs,
@@ -244,6 +249,7 @@ def main() -> None:
     log.info("Done. Cross-rep summary in %s", cross_dir)
 
     from prot_loc_benchmark.provenance import record
+
     record(output_dirs=[cross_dir])
 
 
