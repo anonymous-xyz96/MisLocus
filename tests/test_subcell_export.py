@@ -9,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 
 from test_subcell_provenance import stage_fixture
 from prot_loc_benchmark import cell_crops, provenance
@@ -46,7 +47,8 @@ class ExportChecks(unittest.TestCase):
                         '--provenance-log', str(ledger), '--crop-verification', str(verification), *extra]
                 with patch('sys.argv', args), patch.object(export, 'get_model_dict',
                         side_effect=lambda config: {'vit_model': TinyEncoder(), 'pool_model': TinyPool()}), \
-                        patch.object(provenance, 'PROVENANCE_LOG', original):
+                        patch.object(provenance, 'PROVENANCE_LOG', original), \
+                        patch('yaml.safe_load', return_value={'pretrained_sha256': provenance.sha256(weights)}):
                     export.main(frozen=True)
 
             output = root / 'success'
@@ -75,6 +77,13 @@ class ExportChecks(unittest.TestCase):
             pilot_receipt = json.loads((pilot / 'pilot.json').read_text())
             self.assertEqual(pilot_receipt['artifact_kind'], 'diagnostic_embeddings')
             self.assertTrue(all(info['cells'] == 3 for info in pilot_receipt['outputs'].values()))
+            # Live/source-archive disagreement must fail before publishing features.
+            drifted = root / 'source-drift'
+            with patch.object(provenance, 'code_fingerprint', return_value='0' * 64), \
+                    self.assertRaisesRegex(ValueError, 'Source changed since capture'):
+                run(drifted)
+            self.assertFalse((drifted / 'extraction.json').exists())
+            self.assertFalse(list(drifted.glob('*/embeddings.parquet')))
             # Ledger I/O failure must not publish a successful completion receipt.
             ledger.write_text('invalid json')
             failed = root / 'failed'
@@ -83,6 +92,40 @@ class ExportChecks(unittest.TestCase):
             self.assertFalse((failed / 'extraction.json').exists())
             with self.assertRaisesRegex(ValueError, 'protected'):
                 run(root / 'forbidden', ['--provenance-log', str(release / 'ledger.json')])
+
+    def test_frozen_family_and_relocated_checkpoint_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / 'original-run'
+            original.mkdir()
+            alias = root / 'alias'
+            alias.symlink_to(original, target_is_directory=True)
+            evidence = {'release_root': str(root / 'release'), 'crops_root': str(root / 'crops')}
+            identity = {'kind': 'production', 'config': {'family': 'vit', 'output': str(original)}, 'data': evidence}
+            checkpoint = {'allele_v2': {'identity': identity}, 'state_dict': {}}
+            common = ['extract', '--preflight', str(root / 'cohort'), '--device', 'cpu']
+            with patch.object(export, 'load_preflight', return_value=(None, None, None, evidence)), \
+                    patch.object(export, 'InferenceWrapper', side_effect=RuntimeError('reached model')):
+                for family, other in (('mae', 'vit'), ('vit', 'mae')):
+                    config = provenance.REPO_ROOT / f'configs/subcell_finetune_{other}_s42.yaml'
+                    wrong = yaml.safe_load(config.read_text())['pretrained_sha256']
+                    argv = common + ['--family', family, '--frozen-weights', str(root / 'weights'),
+                                     '--weights-sha256', wrong, '--output', str(root / 'export')]
+                    with patch('sys.argv', argv), self.assertRaisesRegex(ValueError, 'Frozen weights'):
+                        export.main(frozen=True)
+                selected = root / 'receipts/selection.json'
+                for path in (root / 'archive/best.ckpt', root / 'relocated/models/best.ckpt'):
+                    argv = common + ['--family', 'vit', '--checkpoint', str(path), '--selection', str(selected)]
+                    with patch.object(torch, 'load', return_value=checkpoint), \
+                            patch.object(export, 'verify_selection', return_value={'sha256': 'fixture', 'pass': 10}):
+                        with patch('sys.argv', argv + ['--output', str(root / 'exports/new')]), \
+                                self.assertRaisesRegex(RuntimeError, 'reached model'):
+                            export.main()
+                        for protected in (original, alias, path.parent, selected.parent):
+                            for flags in (['--output', str(protected / 'new')],
+                                          ['--output', str(root / 'exports/new'), '--provenance-log', str(protected / 'ledger.json')]):
+                                with patch('sys.argv', argv + flags), self.assertRaisesRegex(ValueError, 'protected'):
+                                    export.main()
 
 
 if __name__ == '__main__':
