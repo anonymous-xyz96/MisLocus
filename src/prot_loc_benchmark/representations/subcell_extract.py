@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import torch
+import yaml
 from models.get_models import get_model_dict
 
 from prot_loc_benchmark import provenance
@@ -85,18 +86,12 @@ def main(*, frozen=False):
     frame, classes, _, evidence = load_preflight(args.preflight)
     protected = [Path(evidence[k]).resolve() for k in ('release_root', 'crops_root')] + [args.preflight.resolve()]
     if args.checkpoint:
-        protected.append(args.checkpoint.resolve().parent.parent)
-    if any(args.output.is_relative_to(p) for p in protected):
-        raise ValueError('Embedding output is inside a protected input directory')
-    if args.provenance_log:
-        ledger = args.provenance_log.resolve()
-        if any(ledger.is_relative_to(p) for p in [*protected, args.output]):
-            raise ValueError('Provenance log is inside a protected input/export directory')
-        provenance.PROVENANCE_LOG = ledger
+        protected.append(args.checkpoint.resolve().parent)
+    if args.selection:
+        protected.append(args.selection.resolve().parent)
     binding = {'protocol': PROTOCOL, 'family': args.family, 'data': evidence, 'precision': 'float32',
                'artifact_kind': 'diagnostic_embeddings' if args.pilot_cells_per_split else 'raw_embeddings',
                'pilot_cells_per_split': args.pilot_cells_per_split, 'batch_size': args.batch_size,
-               'provenance_log': str(provenance.PROVENANCE_LOG),
                'split': args.split, 'preprocessing': 'AGP,Mito,DNA,GFP;128->955->[253:701];joint-minmax-1e-6'}
     if args.crop_verification:
         verified = json.loads(args.crop_verification.read_text())
@@ -113,11 +108,24 @@ def main(*, frozen=False):
                 or identity.get('kind') != 'production'):
             raise ValueError('Checkpoint is not a matching production allele-v2 run')
         selection = verify_selection(args.checkpoint, checkpoint, args.selection)
+        protected.append(Path(identity['config']['output']).resolve())
         state = checkpoint['state_dict']
         binding.update(checkpoint_sha256=selection['sha256'], training=identity, selection=selection,
                        selected_pass=selection['pass'])
     elif not args.weights_sha256:
         parser.error('--weights-sha256 is required for frozen extraction')
+    if args.frozen_weights:
+        recipe = provenance.REPO_ROOT / f'configs/subcell_finetune_{args.family}_s42.yaml'
+        if args.weights_sha256 != yaml.safe_load(recipe.read_text())['pretrained_sha256']:
+            raise ValueError('Frozen weights must match the selected family\'s pinned pretrained identity')
+    if any(args.output.is_relative_to(p) for p in protected):
+        raise ValueError('Embedding output is inside a protected input directory')
+    if args.provenance_log:
+        ledger = args.provenance_log.resolve()
+        if any(ledger.is_relative_to(p) for p in [*protected, args.output]):
+            raise ValueError('Provenance log is inside a protected input/export directory')
+        provenance.PROVENANCE_LOG = ledger
+    binding['provenance_log'] = str(provenance.PROVENANCE_LOG)
     torch.set_float32_matmul_precision('high')
     device = torch.device(args.device)
     wrapper = InferenceWrapper(args.family, state, device)
@@ -141,7 +149,7 @@ def main(*, frozen=False):
     binding['input_sha256'] = {str(p.resolve()): sha256(p) for p in inputs}
     args.output.mkdir(parents=True, exist_ok=False)
     capture_source(args.output)
-    binding.update(invocation=invocation(), runtime=runtime_info(),
+    binding.update(invocation=invocation(args.output), runtime=runtime_info(),
                    source_archive_sha256=sha256(args.output / 'source.tar.gz'))
     preprocess = SubCellPreprocessor()
     outputs, constant_cells = {}, []
