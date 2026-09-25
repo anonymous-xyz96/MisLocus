@@ -4,11 +4,20 @@
 Fresh output only. Without --production, stop after release checks. No extraction
 of T4 features or downstream analyses. At most two training jobs use GPUs0/1 and
 2/3; every job is bounded by native cgroup RAM/CPU/task limits and monitored.
+
+Launch this interpreter directly as a systemd USER service, not through a wrapper:
+  unit=subcell-controller-$(date +%s)
+  systemd-run --user --unit="$unit" -p Type=exec -p WorkingDirectory="$PWD" \\
+    --setenv=SUBCELL_CONTROLLER_UNIT="$unit.service" --setenv=PATH="$PATH" \\
+    .pixi/envs/subcell/bin/python scripts/08e_run_subcell_campaign.py [arguments]
+The controller must be the service MainPID with ExitType=main, RemainAfterExit=no
+and KillMode=control-group. Its CPU/memory/pids controllers must be available.
 """
 import argparse
 import json
 import os
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -23,7 +32,10 @@ import yaml
 from prot_loc_benchmark.provenance import capture_source, code_fingerprint, save_json, sha256, verify_source
 
 GIB = 1024 ** 3
-LIMITS = {'MemoryMax': '256G', 'MemoryHigh': '192G', 'CPUQuota': '1600%', 'TasksMax': '512',
+CGROUP_ROOT = Path('/sys/fs/cgroup')
+EXPECTED_LIMITS = {'memory.max': str(256 * GIB), 'memory.high': str(192 * GIB),
+                   'cpu.max': '1600000 100000', 'pids.max': '512'}
+LIMITS = {'MemoryMax': '256G', 'MemoryHigh': '192G', 'CPUQuota': '1600%', 'CPUQuotaPeriodSec': '100ms', 'TasksMax': '512',
           'OOMPolicy': 'stop', 'KillMode': 'control-group', 'TimeoutStopSec': '120'}
 
 
@@ -78,6 +90,109 @@ def verify_completed_run(run, config, fingerprint):
     return selection
 
 
+def current_cgroup():
+    for line in Path('/proc/self/cgroup').read_text().splitlines():
+        if line.startswith('0::/'):
+            return CGROUP_ROOT / line[3:].lstrip('/')
+    raise RuntimeError('Unified cgroup v2 is required')
+
+
+def verify_job_limits(cgroup=None):
+    cgroup = current_cgroup() if cgroup is None else cgroup
+    try:
+        applied = {name: (cgroup / name).read_text().strip() for name in EXPECTED_LIMITS}
+    except OSError as error:
+        raise RuntimeError('Cannot verify required cgroup limits') from error
+    if applied != EXPECTED_LIMITS:
+        raise RuntimeError(f'Resource limits were not applied: {applied}')
+    return applied
+
+
+def controller_binding():
+    unit = os.environ.get('SUBCELL_CONTROLLER_UNIT', '')
+    if not unit.endswith('.service'):
+        raise RuntimeError('Run this interpreter as a user service with SUBCELL_CONTROLLER_UNIT set to its unit name')
+    text = subprocess.check_output(['systemctl', '--user', 'show', unit, '-p',
+        'Id,ActiveState,SubState,MainPID,ControlGroup,Slice,RemainAfterExit,ExitType,KillMode'], text=True)
+    state = dict(line.split('=', 1) for line in text.splitlines())
+    required = {'Id': unit, 'ActiveState': 'active', 'SubState': 'running', 'MainPID': str(os.getpid()),
+                'RemainAfterExit': 'no', 'ExitType': 'main', 'KillMode': 'control-group'}
+    if (any(state.get(key) != value for key, value in required.items())
+            or not state.get('Slice', '').endswith('.slice') or not state.get('ControlGroup')):
+        raise RuntimeError('Controller must be this process in a live, non-lingering user service')
+    cgroup = CGROUP_ROOT / state['ControlGroup'].lstrip('/')
+    if cgroup != current_cgroup():
+        raise RuntimeError('Controller service does not contain this process')
+    try:
+        for name in EXPECTED_LIMITS:
+            (cgroup / name).read_text()
+    except OSError as error:
+        raise RuntimeError('Required CPU/memory/pids controllers are unavailable') from error
+    return {'unit': unit, 'slice': state['Slice']}
+
+
+def run_jobs(jobs, output, tracker, fingerprint, update):
+    controller = controller_binding()
+    if code_fingerprint() != fingerprint:
+        raise RuntimeError('Source changed during campaign')
+    require_resources(host_resources(output), starting=True)
+    occupied = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True).strip()
+    if occupied:
+        raise RuntimeError('A GPU compute process already exists; refusing overlapping jobs')
+    active = {}
+    try:
+        for name, (gpus, command) in jobs.items():
+            unit = f'subcell-{uuid.uuid4().hex[:12]}-{name}'
+            log = output / 'logs' / f'{name}.log'
+            argv = ['systemd-run', '--user', '--unit=' + unit, '-p', 'Type=exec', '-p', 'RemainAfterExit=yes',
+                    '-p', f'WorkingDirectory={ROOT}', '-p', f'StandardOutput=append:{log}',
+                    '-p', f'StandardError=append:{log}']
+            for key, value in LIMITS.items():
+                argv += ['-p', f'{key}={value}']
+            argv += ['-p', f'BindsTo={controller["unit"]}', '-p', f'After={controller["unit"]}',
+                     '-p', f'Slice={controller["slice"]}', '-p', 'ExecStartPre=' + shlex.join(
+                         [sys.executable, str(Path(__file__).resolve()), '--verify-job-limits'])]
+            env = {'PATH': os.environ['PATH'], 'CUDA_VISIBLE_DEVICES': gpus, 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1',
+                   'OPENBLAS_NUM_THREADS': '1', 'NUMEXPR_NUM_THREADS': '1', 'OMP_THREAD_LIMIT': '1',
+                   'LD_LIBRARY_PATH': '/run/opengl-driver/lib:' + os.environ.get('LD_LIBRARY_PATH', ''),
+                   'PYTHONPATH': f'{ROOT}/src:{ROOT}/vendor/subcell_embed:{ROOT}/vendor/subcellportable',
+                   'PYTHONUNBUFFERED': '1'}
+            for key, value in env.items():
+                argv.append(f'--setenv={key}={value}')
+            argv += command
+            tracker['jobs'][name] = {'unit': unit, 'command': argv, 'log': str(log), 'status': 'starting'}
+            active[name] = unit
+            update(tracker['phase'])
+            subprocess.run(argv, check=True)
+        while active:
+            resources = host_resources(output)
+            require_resources(resources)
+            for name, unit in list(active.items()):
+                text = subprocess.check_output(['systemctl', '--user', 'show', unit, '-p',
+                    'ActiveState,SubState,ExecMainStatus,Result,MemoryCurrent,MemoryPeak,CPUUsageNSec,TasksCurrent,ControlGroup'], text=True)
+                state = dict(line.split('=', 1) for line in text.splitlines())
+                tracker['jobs'][name]['systemd'] = state
+                tracker['jobs'][name]['status'] = job_status(state)
+                cg = CGROUP_ROOT / state['ControlGroup'].lstrip('/')
+                if tracker['jobs'][name]['status'] in ('running', 'starting') or (cg / 'memory.max').is_file():
+                    tracker['jobs'][name]['applied_limits'] = verify_job_limits(cg)
+                if tracker['jobs'][name]['status'] == 'success':
+                    if 'applied_limits' not in tracker['jobs'][name]:
+                        raise RuntimeError(f'No verified resource-limit receipt for {name}')
+                    subprocess.run(['systemctl', '--user', 'stop', unit], check=True)
+                    del active[name]
+                elif tracker['jobs'][name]['status'] == 'failed':
+                    raise RuntimeError(f'{name} failed: {state}')
+            with (output / 'resources.jsonl').open('a') as stream:
+                stream.write(json.dumps({'time': time.time(), **resources, 'jobs': tracker['jobs']}) + '\n')
+            update(tracker['phase'])
+            if active:
+                time.sleep(15)
+    finally:
+        for unit in active.values():
+            subprocess.run(['systemctl', '--user', 'stop', unit], check=False)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--preflight', type=Path, required=True)
@@ -86,6 +201,7 @@ def main():
     parser.add_argument('--production', action='store_true', help='Authorize production ONLY after all checks pass')
     args = parser.parse_args()
     args.output, args.preflight, args.weights_root = [p.resolve() for p in (args.output, args.preflight, args.weights_root)]
+    controller = controller_binding()
     subprocess.run(['git', '-C', str(ROOT), 'diff', '--exit-code', 'HEAD'], check=True)
     if subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '--others', '--exclude-standard'], text=True).strip():
         raise RuntimeError('Start from a clean committed worktree, not the documentation working tree')
@@ -103,75 +219,12 @@ def main():
                'code_sha256': fingerprint, 'source_archive_sha256': sha256(args.output / 'source.tar.gz'),
                'preflight_sha256': sha256(args.preflight / 'preflight.json'),
                'release_revision': evidence['release']['revision'], 'limits_per_job': LIMITS,
-               'production_authorized': args.production, 'phase': 'preparing', 'jobs': {}, 'configs': {}}
+               'production_authorized': args.production, 'controller': controller, 'phase': 'preparing', 'jobs': {}, 'configs': {}}
 
     def update(phase):
         tracker['phase'] = phase
         tracker['updated_at'] = datetime.now(timezone.utc).isoformat()
         save_json(args.output / 'campaign.json', tracker)
-
-    def run_jobs(jobs):
-        if code_fingerprint() != fingerprint:
-            raise RuntimeError('Source changed during campaign')
-        require_resources(host_resources(args.output), starting=True)
-        occupied = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True).strip()
-        if occupied:
-            raise RuntimeError('A GPU compute process already exists; refusing overlapping jobs')
-        active = {}
-        try:
-            for name, (gpus, command) in jobs.items():
-                unit = f'subcell-{uuid.uuid4().hex[:12]}-{name}'
-                log = args.output / 'logs' / f'{name}.log'
-                argv = ['systemd-run', '--user', '--unit=' + unit, '-p', 'Type=exec', '-p', 'RemainAfterExit=yes',
-                        '-p', f'WorkingDirectory={ROOT}', '-p', f'StandardOutput=append:{log}',
-                        '-p', f'StandardError=append:{log}']
-                for key, value in LIMITS.items():
-                    argv += ['-p', f'{key}={value}']
-                if controller := os.environ.get('SUBCELL_CONTROLLER_UNIT'):
-                    argv += ['-p', f'BindsTo={controller}', '-p', f'After={controller}']
-                env = {'PATH': os.environ['PATH'], 'CUDA_VISIBLE_DEVICES': gpus, 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1',
-                       'OPENBLAS_NUM_THREADS': '1', 'NUMEXPR_NUM_THREADS': '1', 'OMP_THREAD_LIMIT': '1',
-                       'LD_LIBRARY_PATH': '/run/opengl-driver/lib:' + os.environ.get('LD_LIBRARY_PATH', ''),
-                       'PYTHONPATH': f'{ROOT}/src:{ROOT}/vendor/subcell_embed:{ROOT}/vendor/subcellportable',
-                       'PYTHONUNBUFFERED': '1'}
-                for key, value in env.items():
-                    argv.append(f'--setenv={key}={value}')
-                argv += command
-                tracker['jobs'][name] = {'unit': unit, 'command': argv, 'log': str(log), 'status': 'starting'}
-                active[name] = unit
-                update(tracker['phase'])
-                subprocess.run(argv, check=True)
-            while active:
-                resources = host_resources(args.output)
-                require_resources(resources)
-                for name, unit in list(active.items()):
-                    text = subprocess.check_output(['systemctl', '--user', 'show', unit, '-p',
-                        'ActiveState,SubState,ExecMainStatus,Result,MemoryCurrent,MemoryPeak,CPUUsageNSec,TasksCurrent,ControlGroup'], text=True)
-                    state = dict(line.split('=', 1) for line in text.splitlines())
-                    tracker['jobs'][name]['systemd'] = state
-                    tracker['jobs'][name]['status'] = job_status(state)
-                    cg = Path('/sys/fs/cgroup') / state['ControlGroup'].lstrip('/')
-                    if (cg / 'memory.max').exists():
-                        applied = {k: (cg / k).read_text().strip() for k in ('memory.max', 'memory.high', 'cpu.max', 'pids.max')}
-                        if applied != {'memory.max': str(256 * GIB), 'memory.high': str(192 * GIB),
-                                       'cpu.max': '1600000 100000', 'pids.max': '512'}:
-                            raise RuntimeError(f'Resource limits were not applied: {applied}')
-                        tracker['jobs'][name]['applied_limits'] = applied
-                    if tracker['jobs'][name]['status'] == 'success':
-                        if 'applied_limits' not in tracker['jobs'][name]:
-                            raise RuntimeError(f'No verified resource-limit receipt for {name}')
-                        subprocess.run(['systemctl', '--user', 'stop', unit], check=True)
-                        del active[name]
-                    elif tracker['jobs'][name]['status'] == 'failed':
-                        raise RuntimeError(f'{name} failed: {state}')
-                with (args.output / 'resources.jsonl').open('a') as stream:
-                    stream.write(json.dumps({'time': time.time(), **resources, 'jobs': tracker['jobs']}) + '\n')
-                update(tracker['phase'])
-                if active:
-                    time.sleep(15)
-        finally:
-            for unit in active.values():
-                subprocess.run(['systemctl', '--user', 'stop', unit], check=False)
 
     def config_for(family, seed, check=False):
         config = yaml.safe_load((ROOT / f'configs/subcell_finetune_{family}_s{seed}.yaml').read_text())
@@ -199,12 +252,13 @@ def main():
         update('frozen-parity')
         run_jobs({'parity': ('0', [sys.executable, str(ROOT / 'tests/subcell_frozen_parity.py'),
                                   '--preflight', str(args.preflight), '--weights-root', str(args.weights_root),
-                                  '--device', 'cuda:0', '--output', str(args.output / 'parity.json')])})
+                                  '--device', 'cuda:0', '--output', str(args.output / 'parity.json')])},
+                 args.output, tracker, fingerprint, update)
         update('full-validation-and-resume')
         launch = [sys.executable, '-m', 'torch.distributed.run', '--standalone', '--nproc_per_node=2']
         checks = {family: config_for(family, 42, check=True) for family in ('mae', 'vit')}
         run_jobs({family + '-check': (gpus, launch + [str(ROOT / 'tests/subcell_release_check.py'), '--config', str(checks[family])])
-                  for family, gpus in (('mae', '0,1'), ('vit', '2,3'))})
+                  for family, gpus in (('mae', '0,1'), ('vit', '2,3'))}, args.output, tracker, fingerprint, update)
         for family in ('mae', 'vit'):
             passed = json.loads((args.output / 'checks' / f'{family}-check/passed.json').read_text())
             if passed['identity']['code_sha256'] != fingerprint or not passed['native_resume_passed']:
@@ -217,7 +271,7 @@ def main():
                 update(f'production-seed-{seed}')
                 run_jobs({f'{family}-s{seed}': (gpus, launch + [str(ROOT / 'scripts/08c_train_subcell_finetune.py'),
                                                           '--config', str(configs[family]), '--fit'])
-                          for family, gpus in (('mae', '0,1'), ('vit', '2,3'))})
+                          for family, gpus in (('mae', '0,1'), ('vit', '2,3'))}, args.output, tracker, fingerprint, update)
                 for family in ('mae', 'vit'):
                     run = args.output / 'runs' / f'{family}-s{seed}'
                     verify_completed_run(run, tracker['configs'][f'{family}-s{seed}']['resolved'], fingerprint)
@@ -229,4 +283,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if sys.argv[1:] == ['--verify-job-limits']:
+        verify_job_limits()
+    else:
+        main()
