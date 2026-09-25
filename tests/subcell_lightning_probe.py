@@ -9,6 +9,7 @@ Uses the production data module, losses, LambdaLR, metrics and checkpoint hooks.
 Small test-only architecture/geometry; tests stochastic resumed trajectories.
 """
 import argparse
+from datetime import timedelta
 import json
 import os
 from pathlib import Path
@@ -76,6 +77,27 @@ def fit(root, frame, classes, family, gpu, stop, name, resume=None):
     return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}, trace.trace
 
 
+def fresh_output(root):
+    """Claim a new result directory collectively, before any fit can overwrite it."""
+    if int(os.environ.get('WORLD_SIZE', '1')) == 1:
+        root.mkdir(exist_ok=False)
+        return
+    # Gloo avoids choosing a CUDA device before Lightning owns device placement.
+    dist.init_process_group('gloo', timeout=timedelta(seconds=60))
+    errors = [None]
+    try:
+        if dist.get_rank() == 0:
+            try:
+                root.mkdir(exist_ok=False)
+            except OSError as error:
+                errors[0] = error
+        dist.broadcast_object_list(errors, src=0)
+    finally:
+        dist.destroy_process_group()
+    if errors[0] is not None:
+        raise errors[0]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--prepare', type=Path)
@@ -94,7 +116,7 @@ def main():
     frame = pd.read_parquet(args.root / 'cohort.parquet')
     classes = json.loads((args.root / 'classes.json').read_text())
     root = args.root / f'{args.family}-{"gpu" if args.gpu else "cpu"}-{os.environ.get("WORLD_SIZE", "1")}'
-    root.mkdir(exist_ok=True)
+    fresh_output(root)
     import prot_loc_benchmark.provenance as provenance
     provenance.PROVENANCE_LOG = root / 'provenance_log.json'
     full, trace_full = fit(root, frame, classes, args.family, args.gpu, 20, 'full')
