@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tarfile
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from prot_loc_benchmark.config import DATA_DIR, REPO_ROOT
@@ -283,7 +283,7 @@ def record(
         Wall-clock duration of the run (optional).
     """
     git = get_git_info()
-    now = datetime.now(UTC).isoformat(timespec="seconds")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")  # noqa: UP017 -- Cytoself uses Python 3.10.
     argv = sys.argv
     script = argv[0] if argv else "unknown"
 

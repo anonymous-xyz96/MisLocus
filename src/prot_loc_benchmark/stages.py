@@ -227,11 +227,12 @@ def stage(directory, inputs, parameters, *, parents=(), allowed=()):
         outputs = {}
         for path in sorted(directory.rglob("*")):
             relative = path.relative_to(directory)
-            if relative.parts[0] in allowed or not path.is_file():
+            if relative.parts[0] in allowed:
                 continue
             if path.is_symlink() or not path.resolve().is_relative_to(directory.resolve()):
                 raise ValueError(f"Output symlink/escape: {path}")
-            outputs[str(relative)] = sha256(path)
+            if path.is_file():
+                outputs[str(relative)] = sha256(path)
         save_json(
             directory / "stage.json",
             {
