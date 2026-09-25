@@ -56,10 +56,31 @@ These fixes alone do not demonstrate that old scientific artifacts need regenera
 Corrections are propagated through the existing dependency stack with forward-only
 parent synchronization, not force-pushes. PR #1 remains an unmerged historical reference.
 Scoped AI review and synthetic CPU checks are not human approval or GitHub CI.
-The remaining full PR reviews and authorized CI publication are still merge gates;
-no PR is merged or represented as approved by this note.
+Full incremental AI reviews are complete. Authorized CI publication/checks and
+human approval remain merge gates; no PR is merged or approved by this note.
 
 Detailed red/green, correction-review, per-tip validation and historical audit records
 are retained under the external job `pr3-pr5-provenance-fixes-20260924-v1`.
 Historical rank-RNG correlation, unknown backend flags, seed42-only reporting and
 unresolved matched downstream-processing/evaluation gates remain unchanged.
+
+## 2026-09-25: remaining-PR follow-up
+
+One independent reviewer per PR completed #7–#19 in batches of five/five/three.
+Seven grouped issues were corrected in their introducing slices, then propagated:
+
+- #9 requires fresh probe outputs, including collective refusal on distributed ranks.
+- #10/#11 load historical extraction configuration from the saved run, not migrated
+  recipes. The shared fix covers both families; #15 retires that legacy path/test.
+- #14 checks frozen digests against the selected family's pinned recipe, protects
+  checkpoint/receipt directories and the recorded original run without assuming
+  a relocated checkpoint layout, and binds source capture in this slice, not #15.
+- #16 requires this controller process to own a live service in the user manager.
+  Jobs bind to its lifetime and slice; an ExecStartPre guard verifies cgroup limits
+  before the job body starts. Missing or incorrect live limits stop active jobs.
+
+Regression and review records are retained in external job
+`pr9-16-sequential-fixes-20260925-v1`. These are implementation corrections, not
+new production fits/exports, changes to scientific settings, or retroactive
+provenance repair. Review each remote PR against its updated immediate parent;
+retain parent branches and ancestry until dependent PRs have been retargeted.
