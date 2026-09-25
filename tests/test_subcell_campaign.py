@@ -3,6 +3,8 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import os
+from unittest.mock import patch
 from pathlib import Path
 
 path = Path(__file__).resolve().parents[1] / 'scripts/08e_run_subcell_campaign.py'
@@ -59,6 +61,75 @@ class CampaignChecks(unittest.TestCase):
             save_json(run / 'selection.json', {**selection, 'macro_ap': .9})
             with self.assertRaisesRegex(ValueError, 'native checkpoint selector'):
                 campaign.verify_completed_run(run, config, fingerprint)
+
+    def test_controller_binding_requires_own_live_user_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cg = root / 'app.slice/controller.service'
+            cg.mkdir(parents=True)
+            for name in ('memory.max', 'memory.high', 'cpu.max', 'pids.max'):
+                (cg / name).write_text('max')
+            state = {'Id': 'controller.service', 'ActiveState': 'active', 'SubState': 'running',
+                     'MainPID': str(os.getpid()), 'ControlGroup': '/app.slice/controller.service',
+                     'Slice': 'app.slice', 'RemainAfterExit': 'no', 'ExitType': 'main', 'KillMode': 'control-group'}
+            with patch.dict(os.environ, SUBCELL_CONTROLLER_UNIT='controller.service'), \
+                    patch.object(campaign, 'CGROUP_ROOT', root), patch.object(campaign, 'current_cgroup', return_value=cg), \
+                    patch.object(campaign.subprocess, 'check_output') as show:
+                for change in ({}, {'MainPID': '0'}, {'ActiveState': 'inactive'}, {'RemainAfterExit': 'yes'},
+                               {'ExitType': 'cgroup'}, {'KillMode': 'process'}, {'ControlGroup': '/other'}, {'Id': 'other.service'}):
+                    show.return_value = '\n'.join(f'{k}={v}' for k, v in {**state, **change}.items())
+                    if change:
+                        with self.assertRaises(RuntimeError):
+                            campaign.controller_binding()
+                    else:
+                        self.assertEqual(campaign.controller_binding(), {'unit': 'controller.service', 'slice': 'app.slice'})
+                        self.assertEqual(show.call_args.args[0][:3], ['systemctl', '--user', 'show'])
+                show.return_value = '\n'.join(f'{k}={v}' for k, v in state.items())
+                (cg / 'pids.max').unlink()
+                with self.assertRaisesRegex(RuntimeError, 'controllers'):
+                    campaign.controller_binding()
+                with patch.dict(os.environ, SUBCELL_CONTROLLER_UNIT=''), self.assertRaises(RuntimeError):
+                    campaign.controller_binding()
+
+    def test_launch_limits_fail_closed_and_stop_services(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cg = root / 'jobs/job'
+            cg.mkdir(parents=True)
+            expected = {'memory.max': str(256 * campaign.GIB), 'memory.high': str(192 * campaign.GIB),
+                        'cpu.max': '1600000 100000', 'pids.max': '512'}
+            state = 'ActiveState=active\nSubState=running\nResult=success\nExecMainStatus=0\nControlGroup=/jobs/job'
+            resources = {'available_memory_bytes': 700 * campaign.GIB, 'free_disk_bytes': 200 * campaign.GIB,
+                         'gpu': '\n'.join(f'{i}, UUID{i}, 1, 95830, 30, 0' for i in range(4))}
+            with patch.object(campaign, 'CGROUP_ROOT', root), patch.object(campaign, 'code_fingerprint', return_value='fixed'), \
+                    patch.object(campaign, 'controller_binding', return_value={'unit': 'controller.service', 'slice': 'app.slice'}), \
+                    patch.object(campaign, 'host_resources', return_value=resources), patch.object(campaign.subprocess, 'run') as run, \
+                    patch.object(campaign.subprocess, 'check_output') as show, patch.object(campaign.time, 'sleep') as sleep:
+                for failure in ('memory.max', 'memory.high', 'cpu.max', 'pids.max', 'wrong', None):
+                    for name, value in expected.items():
+                        (cg / name).write_text(value)
+                    if failure in expected:
+                        (cg / failure).unlink()
+                    elif failure == 'wrong':
+                        (cg / 'memory.max').write_text('max')
+                    show.side_effect = ['', state, state.replace('running', 'exited')]
+                    tracker = {'phase': 'test', 'jobs': {}}
+                    run.reset_mock()
+                    sleep.reset_mock()
+                    if failure:
+                        with self.assertRaisesRegex(RuntimeError, 'limits'):
+                            campaign.run_jobs({'probe': ('0', ['NEVER_EXECUTED'])}, root, tracker, 'fixed', lambda _: None)
+                        sleep.assert_not_called()
+                    else:
+                        campaign.run_jobs({'probe': ('0', ['NEVER_EXECUTED'])}, root, tracker, 'fixed', lambda _: None)
+                        self.assertEqual(tracker['jobs']['probe']['applied_limits'], expected)
+                        self.assertEqual(tracker['jobs']['probe']['status'], 'success')
+                    command = run.call_args_list[0].args[0]
+                    self.assertIn('BindsTo=controller.service', command)
+                    self.assertIn('After=controller.service', command)
+                    self.assertIn('Slice=app.slice', command)
+                    self.assertTrue(any(arg.startswith('ExecStartPre=') and '--verify-job-limits' in arg for arg in command))
+                    self.assertEqual(run.call_args.args[0][:3], ['systemctl', '--user', 'stop'])
 
     def test_resource_guards(self):
         baseline = {'available_memory_bytes': 700 * campaign.GIB, 'free_disk_bytes': 200 * campaign.GIB,
