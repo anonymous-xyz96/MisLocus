@@ -425,7 +425,7 @@ def main():
     if args.representation == "cellprofiler":
         inputs.append(CROP_MANIFEST_DIR / args.batch / "manifest.parquet")
     elif args.representation.startswith("subcell_allele_rybg_v2_"):
-        inputs += export_inputs(args.extraction_spec, args.representation)
+        inputs += export_inputs(args.extraction_spec, args.representation, output_dir=output_dir)
     settings = {
         **vars(args),
         "well_min_cells": PREPROCESS_CC_THRESHOLD,
