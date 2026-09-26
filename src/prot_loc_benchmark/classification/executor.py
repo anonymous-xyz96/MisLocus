@@ -7,14 +7,13 @@ multiple classification scripts can share one implementation.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .io import ClassificationWriter
 from .metrics import compute_classifier_metrics
-from .train import _count_gpus, train_and_predict
+from .train import allocated_gpu, train_and_predict
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +40,7 @@ def _run_classifier(task: dict, task_device: str) -> dict | None:
     m = compute_classifier_metrics(preds, labels)
     n_train_pos = int((train_df["Label"] == 1).sum())
     n_train_neg = int((train_df["Label"] == 0).sum())
-    imbalance = (
-        max(n_train_pos, n_train_neg) / max(min(n_train_pos, n_train_neg), 1)
-    )
+    imbalance = max(n_train_pos, n_train_neg) / max(min(n_train_pos, n_train_neg), 1)
 
     return {
         "classifier_id": classifier_id,
@@ -74,15 +71,9 @@ def run_classifier_tasks(
     tasks
         List of dicts, each with keys:
         ``pair``, ``channel``, ``ch_features``, ``fold``, ``train_df``, ``test_df``.
-        The train/test dataframes are read-only — this function does not
-        modify them. Each task dict, however, is mutated in-place to add a
-        ``"device"`` key (set to ``"cpu"`` or e.g. ``"cuda:0"`` based on the
-        ``device`` argument and fold_id) before dispatch. Callers that
-        intend to reuse the same task list across multiple runs should be
-        aware that the device assignment carries over.
+        Dataframes are read-only; each task receives the same explicit device.
     device
-        ``"cpu"`` or a non-cpu device string. Non-cpu triggers GPU fold-parallel
-        execution across available GPUs (capped at 4).
+        CPU or the one allocated logical GPU; no physical-device discovery.
     output_dir
         Directory where ``predictions.parquet`` will be written.
 
@@ -97,33 +88,15 @@ def run_classifier_tasks(
     info_rows: list[dict] = []
     n_classifiers = 0
 
-    if device != "cpu":
-        n_gpus = _count_gpus()
-        max_workers = min(n_gpus, 4)
-        for task in tasks:
-            gpu_id = task["fold"].fold_id % max_workers
-            task["device"] = f"cuda:{gpu_id}"
-        logger.info(
-            "Running %d classifiers fold-parallel across %d GPUs",
-            len(tasks), max_workers,
-        )
-    else:
-        max_workers = min(8, os.cpu_count() or 1)
-        for task in tasks:
-            task["device"] = "cpu"
-        logger.info(
-            "Running %d classifiers (max_workers=%d, CPU)",
-            len(tasks), max_workers,
-        )
+    max_workers = 1
+    for task in tasks:
+        task["device"] = device
 
     t_class = time.time()
     predictions_path = output_dir / "predictions.parquet"
-    with ClassificationWriter(predictions_path) as writer:
+    with allocated_gpu(device), ClassificationWriter(predictions_path) as writer:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_run_classifier, t, t["device"]): t
-                for t in tasks
-            }
+            futures = {executor.submit(_run_classifier, t, t["device"]): t for t in tasks}
             for future in as_completed(futures):
                 r = future.result()
                 if r is None:
@@ -146,48 +119,52 @@ def run_classifier_tasks(
                     is_control=pair.is_control,
                 )
 
-                metrics_rows.append({
-                    "classifier_id": r["classifier_id"],
-                    "pair_id": pair.pair_id,
-                    "gene": pair.gene,
-                    "allele_ref": pair.allele_ref,
-                    "allele_var": pair.allele_var,
-                    "channel": channel,
-                    "fold_id": fold.fold_id,
-                    "is_control": pair.is_control,
-                    "category": pair.category,
-                    "n_train": r["train_height"],
-                    "n_test": test_df.height,
-                    "imbalance_ratio": r["imbalance"],
-                    **r["metrics"],
-                })
-
-                top_feats = sorted(
-                    r["importances"].items(), key=lambda x: x[1], reverse=True
-                )[:50]
-                for feat_name, feat_imp in top_feats:
-                    importance_rows.append({
+                metrics_rows.append(
+                    {
                         "classifier_id": r["classifier_id"],
-                        "feature": feat_name,
-                        "importance": feat_imp,
-                    })
+                        "pair_id": pair.pair_id,
+                        "gene": pair.gene,
+                        "allele_ref": pair.allele_ref,
+                        "allele_var": pair.allele_var,
+                        "channel": channel,
+                        "fold_id": fold.fold_id,
+                        "is_control": pair.is_control,
+                        "category": pair.category,
+                        "n_train": r["train_height"],
+                        "n_test": test_df.height,
+                        "imbalance_ratio": r["imbalance"],
+                        **r["metrics"],
+                    }
+                )
 
-                info_rows.append({
-                    "classifier_id": r["classifier_id"],
-                    "pair_id": pair.pair_id,
-                    "gene": pair.gene,
-                    "allele_ref": pair.allele_ref,
-                    "allele_var": pair.allele_var,
-                    "channel": channel,
-                    "fold_id": fold.fold_id,
-                    "is_control": pair.is_control,
-                    "category": pair.category,
-                    "n_train_ref": r["n_train_pos"],
-                    "n_train_var": r["n_train_neg"],
-                    "n_test": test_df.height,
-                    "test_plates": ",".join(fold.test_plates),
-                    "test_wells": ",".join(fold.test_wells),
-                })
+                top_feats = sorted(r["importances"].items(), key=lambda x: x[1], reverse=True)[:50]
+                for feat_name, feat_imp in top_feats:
+                    importance_rows.append(
+                        {
+                            "classifier_id": r["classifier_id"],
+                            "feature": feat_name,
+                            "importance": feat_imp,
+                        }
+                    )
+
+                info_rows.append(
+                    {
+                        "classifier_id": r["classifier_id"],
+                        "pair_id": pair.pair_id,
+                        "gene": pair.gene,
+                        "allele_ref": pair.allele_ref,
+                        "allele_var": pair.allele_var,
+                        "channel": channel,
+                        "fold_id": fold.fold_id,
+                        "is_control": pair.is_control,
+                        "category": pair.category,
+                        "n_train_ref": r["n_train_pos"],
+                        "n_train_var": r["n_train_neg"],
+                        "n_test": test_df.height,
+                        "test_plates": ",".join(fold.test_plates),
+                        "test_wells": ",".join(fold.test_wells),
+                    }
+                )
 
     t_class_elapsed = time.time() - t_class
     logger.info(
