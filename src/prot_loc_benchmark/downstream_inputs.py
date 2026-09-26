@@ -11,12 +11,17 @@ from prot_loc_benchmark.provenance import sha256, verify_source
 from prot_loc_benchmark.stages import require_bounded_execution
 
 
-def export_inputs(spec_path, representation):
-    """Declare files before entering stage(); verify their contents inside that transaction."""
+def export_inputs(spec_path, representation, *, output_dir=None):
+    """Check output isolation before stage(); verify declared inputs inside that transaction."""
     if spec_path is None:
         raise ValueError("New SubCell preprocessing requires --extraction-spec")
     spec_path = Path(spec_path).resolve()
     spec = json.loads(spec_path.read_text())
+    export_root = Path(spec["export_root"]).resolve()
+    if DATA_DIR.resolve().is_relative_to(export_root) or (
+        output_dir is not None and Path(output_dir).resolve().is_relative_to(export_root)
+    ):
+        raise ValueError("Analysis root/output must not be inside producer exports")
     matches = [(name, m) for name, m in spec["models"].items() if m["representation"] == representation]
     if len(matches) != 1:
         raise ValueError("Representation absent or duplicated in extraction specification")
@@ -41,6 +46,7 @@ def verify_export(spec_path, representation, batch, input_path):
     if spec_path is None:
         raise ValueError("New SubCell preprocessing requires --extraction-spec")
     require_bounded_execution(representation)
+    inputs = export_inputs(spec_path, representation)
     spec_path = Path(spec_path).resolve()
     spec = json.loads(spec_path.read_text())
     spec_digest = sha256(spec_path)
@@ -60,8 +66,6 @@ def verify_export(spec_path, representation, batch, input_path):
         raise ValueError("Changed independent verification report")
     verified = json.loads(verification_path.read_text())
     export = Path(spec["export_root"]) / representation
-    if DATA_DIR.resolve().is_relative_to(Path(spec["export_root"]).resolve()):
-        raise ValueError("Analysis root must not be inside producer exports")
     receipt_path = export / "extraction.json"
     if sha256(receipt_path) != verified["receipt_sha256"]:
         raise ValueError("Changed extraction receipt")
@@ -132,4 +136,4 @@ def verify_export(spec_path, representation, batch, input_path):
         .item()
     ):
         raise ValueError("Raw SubCell embeddings contain null/nonfinite features")
-    return export_inputs(spec_path, representation)
+    return inputs

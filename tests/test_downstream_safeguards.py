@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,8 @@ from unittest.mock import patch
 
 import polars as pl
 
-from prot_loc_benchmark import provenance, stages
+from prot_loc_benchmark import downstream_inputs, provenance, stages
+from prot_loc_benchmark.config import REPO_ROOT
 from prot_loc_benchmark.downstream_inputs import verify_export
 from prot_loc_benchmark.identity import CELL_ID, identify_cells, ordered_id_hash
 from prot_loc_benchmark.provenance import capture_source, code_fingerprint, save_json, sha256
@@ -125,11 +127,24 @@ class Safeguards(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ceilings"):
                 stages.require_bounded_execution("subcell_allele_rybg_v2_mae_s42")
 
-    def test_verified_export_contract_rejects_partial_wrong_checkpoint_and_tampering(self):
+    @patch.dict(os.environ, {"MISLOCUS_CAMPAIGN_SLICE": "mislocus-downstream-test.slice"})
+    @patch.object(
+        stages,
+        "cgroup_limits",
+        return_value={
+            "/mislocus-downstream-test.slice": {
+                "cpu.max": "200000 100000",
+                "memory.high": "3221225472",
+                "memory.max": "4294967296",
+                "pids.max": "128",
+            }
+        },
+    )
+    def test_verified_export_contract_rejects_partial_wrong_checkpoint_and_tampering(self, _limits):
         # A small producer-shaped fixture, not a trusted substitute for production verification.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            export = root / "exports" / "subcell_allele_rybg_v2_mae_s42"
+            export = root / "interim" / "subcell_allele_rybg_v2_mae_s42"
             export.mkdir(parents=True)
             capture_source(export)
             control = root / "control"
@@ -177,7 +192,7 @@ class Safeguards(unittest.TestCase):
                 },
                 "expected_batch_split_counts": {batch: counts},
                 "control": str(control),
-                "export_root": str(root / "exports"),
+                "export_root": str(root / "interim"),
                 "training_code_sha256": "training",
                 "code_sha256": code_fingerprint(),
                 "source_commit": json.loads((export / "source.json").read_text())["git_head"],
@@ -219,6 +234,58 @@ class Safeguards(unittest.TestCase):
                 )
 
             publish(receipt)
+            with (
+                patch.object(downstream_inputs, "DATA_DIR", export),
+                self.assertRaisesRegex(ValueError, "producer exports"),
+            ):
+                verify_export(spec_path, rep, batch, path)
+            preprocess = load_script(REPO_ROOT / "scripts/06_preprocess_profiles.py", "preprocess_isolation")
+            frozen = {str(p.relative_to(export)): sha256(p) for p in export.rglob("*") if p.is_file()}
+            alias = root / "linked-interim"
+            alias.symlink_to(export.parent, target_is_directory=True)
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    ["preprocess", "--batch", batch, "--representation", rep, "--extraction-spec", str(spec_path)],
+                ),
+                patch.object(preprocess, "preprocess_embedding_batch") as compute,
+                patch.object(provenance, "PROVENANCE_LOG", root / "ledger.json"),
+            ):
+                for interim in (export.parent, alias):
+                    with (
+                        patch.object(preprocess, "INTERIM_DIR", interim),
+                        patch.object(stages, "DATA_DIR", root),
+                        patch.object(downstream_inputs, "DATA_DIR", root),
+                        patch.dict(os.environ, {"MISLOCUS_DATA_ROOT": str(root)}),
+                        self.assertRaisesRegex(ValueError, "producer exports"),
+                    ):
+                        try:
+                            preprocess.main()
+                        finally:
+                            self.assertEqual(
+                                {str(p.relative_to(export)): sha256(p) for p in export.rglob("*") if p.is_file()},
+                                frozen,
+                                "Preprocessing wrote into frozen producer exports before rejecting the output",
+                            )
+                compute.assert_not_called()
+                # A separate output with a raw-file symlink is the supported layout.
+                analysis = root / "analysis"
+                output_dir = analysis / "interim" / rep / batch
+                output_dir.mkdir(parents=True)
+                (output_dir / "embeddings.parquet").symlink_to(path)
+                with (
+                    patch.object(preprocess, "INTERIM_DIR", analysis / "interim"),
+                    patch.object(stages, "DATA_DIR", analysis),
+                    patch.object(downstream_inputs, "DATA_DIR", analysis),
+                    patch.dict(os.environ, {"MISLOCUS_DATA_ROOT": str(analysis)}),
+                ):
+                    preprocess.main()
+                compute.assert_called_once_with(batch, rep, normalized_only=False)
+                stages.require_stage(output_dir)
+                self.assertEqual(
+                    {str(p.relative_to(export)): sha256(p) for p in export.rglob("*") if p.is_file()}, frozen
+                )
             inputs = verify_export(spec_path, rep, batch, path)
             self.assertIn(checkpoint, inputs)
             for changed in (
