@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -85,22 +86,21 @@ def compute_null_threshold(
     Returns dict mapping channel name to AUROC threshold.
     """
     if control_metrics.is_empty():
-        logger.warning("No control metrics available, using default threshold 0.5")
-        return {}
+        raise ValueError("No control metrics: run controls before calling hits")
 
     thresholds: dict[str, float] = {}
     q = percentile / 100.0
 
-    # Drop NaN AUROCs before computing quantiles (edge-case classifiers)
-    valid = control_metrics.filter(~pl.col("auroc").is_nan())
+    # Undefined test AUROCs are not calibration observations.
+    valid = control_metrics.filter(pl.col("auroc").is_finite())
+    if valid.is_empty():
+        raise ValueError("No finite control AUROCs available for calibration")
     n_dropped = control_metrics.height - valid.height
     if n_dropped > 0:
-        logger.info("Dropped %d control classifiers with NaN AUROC", n_dropped)
+        logger.info("Dropped %d control classifiers with undefined AUROC", n_dropped)
 
     for row in (
-        valid.group_by("channel")
-        .agg(pl.col("auroc").quantile(q).alias("threshold"))
-        .iter_rows(named=True)
+        valid.group_by("channel").agg(pl.col("auroc").quantile(q, "nearest").alias("threshold")).iter_rows(named=True)
     ):
         thresholds[row["channel"]] = row["threshold"]
         logger.info(
@@ -111,6 +111,19 @@ def compute_null_threshold(
         )
 
     return thresholds
+
+
+def validate_thresholds(thresholds: dict[str, float], channels: list[str]) -> None:
+    """Fail closed rather than fabricate an uncalibrated hit/non-hit."""
+    invalid = [
+        ch
+        for ch in channels
+        if not isinstance(thresholds.get(ch), (int, float))
+        or not np.isfinite(thresholds[ch])
+        or not 0 <= thresholds[ch] <= 1
+    ]
+    if invalid:
+        raise ValueError(f"Missing or invalid control calibration for channels: {sorted(invalid)}")
 
 
 def aggregate_allele_metrics(
@@ -128,8 +141,9 @@ def aggregate_allele_metrics(
     4. Compute mean AUROC and other summary stats
     5. Call hits: mean_auroc > null_threshold[channel]
     """
-    # Filter by imbalance
-    filtered = metrics_df.filter(pl.col("imbalance_ratio") <= max_imbalance)
+    validate_thresholds(null_thresholds, metrics_df["channel"].unique().to_list())
+    # Undefined AUROCs cannot contribute to either a hit or classifier count.
+    filtered = metrics_df.filter((pl.col("imbalance_ratio") <= max_imbalance) & pl.col("auroc").is_finite())
 
     if filtered.is_empty():
         logger.warning("All classifiers filtered out by imbalance threshold")
@@ -154,9 +168,7 @@ def aggregate_allele_metrics(
 
     # Add null threshold and hit call
     agg = agg.with_columns(
-        pl.col("channel")
-        .replace_strict(null_thresholds, default=0.5)
-        .alias("null_threshold"),
+        pl.col("channel").replace_strict(null_thresholds, return_dtype=pl.Float64).alias("null_threshold"),
     )
     agg = agg.with_columns(
         (pl.col("auroc_mean") > pl.col("null_threshold")).alias("is_hit"),
@@ -189,12 +201,38 @@ def load_single_fold_metrics(
     cleanest evaluation against DL encoders that were trained on T1+T2 with
     T3 as validation (T4 is fully held out from the encoder).
 
-    Each (pair, channel) maps to exactly one fold here, so ``auroc_mean`` is
-    the single-fold AUROC and ``auroc_std`` is 0. ``null_threshold`` and
-    ``is_hit`` are filled with placeholders (0.5 / False) — downstream
-    benchmarks read ``auroc_mean`` only.
+    Prefer completed controls-first outputs in ``{representation}_t4``.
+    For legacy all-fold files, calibrate from their actual T4 control rows;
+    never insert placeholder thresholds, hits or uncertainty.
     """
-    base = (classification_dir or CLASSIFICATION_OUTPUT_DIR) / representation / batch
+    root = classification_dir or CLASSIFICATION_OUTPUT_DIR
+    direct = root / f"{representation}_t4" / batch
+    guarded = representation.startswith("subcell_allele_rybg_v2_") or any(
+        (direct / marker).exists()
+        for marker in ("started.json", "stage.json", "controls/started.json", "controls/stage.json")
+    )
+    if test_plate_suffix == "T4" and guarded and not (direct / "completion.json").exists():
+        raise ValueError(f"Incomplete T4 classification: {direct}")
+    if test_plate_suffix == "T4" and (direct / "completion.json").exists():
+        from prot_loc_benchmark.provenance import sha256
+
+        from .calibration import load_calibration
+
+        receipt = json.loads((direct / "completion.json").read_text())
+        if receipt.get("status") != "complete":
+            raise ValueError(f"Incomplete T4 classification: {direct}")
+        from prot_loc_benchmark.stages import require_stage
+
+        require_stage(direct, representation=representation, batch=batch)
+        if receipt["context"].get("protocol") != "t1-t3_train_t4_test":
+            raise ValueError("Completed classifier stage is not the requested T4 protocol")
+        if sha256(direct / "controls/calibration.json") != receipt["calibration_sha256"]:
+            raise ValueError("Changed control calibration")
+        load_calibration(direct / "controls", receipt["context"])
+        # A valid single-fold SD column is entirely null; CSV inference otherwise
+        # makes it String, breaking numeric aggregation/concatenation downstream.
+        return pl.read_csv(direct / "metrics_summary.csv", schema_overrides={"auroc_std": pl.Float64})
+    base = root / representation / batch
     info_path = base / "classifier_info.csv"
     metrics_path = base / "metrics.csv"
     if not info_path.exists() or not metrics_path.exists():
@@ -203,35 +241,25 @@ def load_single_fold_metrics(
 
     info = pl.read_csv(info_path)
     metrics = pl.read_csv(metrics_path)
+    for name, frame in ((info_path, info), (metrics_path, metrics)):
+        if frame["classifier_id"].null_count() or frame["classifier_id"].n_unique() != frame.height:
+            raise ValueError(f"Missing or duplicate classifier identities: {name}")
+    if set(metrics["classifier_id"]) - set(info["classifier_id"]):
+        raise ValueError("Missing classifier metadata for recorded metrics")
 
-    keep_ids = info.filter(
-        pl.col("test_plates").str.ends_with(test_plate_suffix)
-    ).select("classifier_id")
+    keep_ids = info.filter(pl.col("test_plates").str.ends_with(test_plate_suffix)).select("classifier_id")
     if keep_ids.is_empty():
         logger.warning(
             "No classifiers with test_plates ending in %r for %s/%s",
-            test_plate_suffix, representation, batch,
+            test_plate_suffix,
+            representation,
+            batch,
         )
         return pl.DataFrame()
 
-    one_fold = (
-        metrics.join(keep_ids, on="classifier_id", how="inner")
-        .filter(pl.col("category").is_in(["Exp", "cPC"]))
-        .filter(pl.col("imbalance_ratio") <= max_imbalance)
-    )
+    heldout = metrics.join(keep_ids, on="classifier_id", how="inner", validate="m:1")
+    one_fold = heldout.filter(pl.col("category").is_in(["Exp", "cPC"]))
     if one_fold.is_empty():
         return pl.DataFrame()
-
-    return one_fold.select([
-        "pair_id",
-        "gene",
-        "allele_var",
-        "channel",
-        pl.col("auroc").alias("auroc_mean"),
-        pl.lit(0.0).alias("auroc_std"),
-        pl.col("auprc").alias("auprc_mean"),
-        pl.col("balanced_accuracy").alias("balanced_accuracy_mean"),
-        pl.lit(1).alias("n_classifiers"),
-        pl.lit(0.5).alias("null_threshold"),
-        pl.lit(False).alias("is_hit"),
-    ])
+    thresholds = compute_null_threshold(heldout.filter(pl.col("category").is_in(["NC", "PC"])))
+    return aggregate_allele_metrics(one_fold, thresholds, max_imbalance=max_imbalance, min_classifiers=1)

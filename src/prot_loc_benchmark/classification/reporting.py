@@ -66,10 +66,15 @@ def plot_auroc_distributions(
     exp_metrics: pl.DataFrame,
     output_dir: Path,
     batch_id: str,
+    null_thresholds: dict[str, float],
 ) -> None:
-    """Plot AUROC distributions per channel: control null vs experimental."""
+    """Plot the saved calibration threshold, never a second quantile estimate."""
+    from .metrics import validate_thresholds
+
+    validate_thresholds(null_thresholds, exp_metrics["channel"].unique().to_list())
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
@@ -77,15 +82,13 @@ def plot_auroc_distributions(
         logger.warning("matplotlib not available, skipping distribution plot")
         return
 
-    ctrl = control_metrics.filter(~pl.col("auroc").is_nan())
-    exp = exp_metrics.filter(~pl.col("auroc").is_nan())
+    ctrl = control_metrics.filter(pl.col("auroc").is_finite())
+    exp = exp_metrics.filter(pl.col("auroc").is_finite())
 
-    channels = sorted(ctrl["channel"].unique().to_list())
+    channels = sorted(null_thresholds if exp.is_empty() else exp["channel"].unique().to_list())
     n_ch = len(channels)
     if n_ch == 0:
-        logger.warning(
-            "No control channels with valid AUROC values, skipping distribution plot"
-        )
+        logger.warning("No control channels with valid AUROC values, skipping distribution plot")
         return
 
     fig, axes = plt.subplots(1, n_ch, figsize=(4 * n_ch, 4), sharey=False)
@@ -97,17 +100,15 @@ def plot_auroc_distributions(
         exp_auroc = exp.filter(pl.col("channel") == ch)["auroc"].to_numpy()
 
         bins = np.linspace(0.3, 1.0, 40)
-        ax.hist(ctrl_auroc, bins=bins, alpha=0.6,
-                label=f"Control (n={len(ctrl_auroc)})",
-                color="steelblue", density=True)
-        ax.hist(exp_auroc, bins=bins, alpha=0.6,
-                label=f"Exp+cPC (n={len(exp_auroc)})",
-                color="coral", density=True)
+        ax.hist(
+            ctrl_auroc, bins=bins, alpha=0.6, label=f"Control (n={len(ctrl_auroc)})", color="steelblue", density=True
+        )
+        if len(exp_auroc):
+            ax.hist(exp_auroc, bins=bins, alpha=0.6, label=f"Exp+cPC (n={len(exp_auroc)})", color="coral", density=True)
 
         if len(ctrl_auroc) > 0:
-            pval = float(np.quantile(ctrl_auroc[~np.isnan(ctrl_auroc)], NULL_PERCENTILE / 100.0))
-            ax.axvline(pval, color="navy", linestyle="--", linewidth=1.5,
-                       label=f"p{NULL_PERCENTILE}={pval:.3f}")
+            pval = null_thresholds[ch]
+            ax.axvline(pval, color="navy", linestyle="--", linewidth=1.5, label=f"p{NULL_PERCENTILE}={pval:.3f}")
 
         ax.set_title(ch)
         ax.set_xlabel("AUROC")
