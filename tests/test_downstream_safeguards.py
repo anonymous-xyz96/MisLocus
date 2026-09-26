@@ -12,6 +12,9 @@ from unittest.mock import patch
 import polars as pl
 
 from prot_loc_benchmark import downstream_inputs, provenance, stages
+from prot_loc_benchmark.classification import executor
+from prot_loc_benchmark.classification.cv import CVFold
+from prot_loc_benchmark.classification.pairs import ClassificationPair
 from prot_loc_benchmark.classification.train import allocated_gpu, select_device, train_and_predict
 from prot_loc_benchmark.config import REPO_ROOT
 from prot_loc_benchmark.downstream_inputs import verify_export
@@ -127,6 +130,80 @@ class Safeguards(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "fallback"):
                 train_and_predict(frame, frame, ["f"], device="cuda:0", xgb_params={"n_jobs": 3})
             self.assertEqual(classifier.call_args.kwargs["n_jobs"], 3)
+
+    def test_executor_holds_gpu_lease_through_fit_and_writer_close(self):
+        frame = pl.DataFrame(
+            {
+                "f": [0.0, 1.0, 2.0, 3.0],
+                "Label": [0, 1, 0, 1],
+                "Metadata_Plate": ["P_T4"] * 4,
+                "Metadata_well_position": ["A01"] * 4,
+                "Metadata_ObjectNumber": [1, 2, 3, 4],
+            }
+        )
+        task = {
+            "train_df": frame,
+            "test_df": frame,
+            "ch_features": ["f"],
+            "channel": "EMBED",
+            "pair": ClassificationPair("pair", "GENE", "ref", "var", False, "Exp"),
+            "fold": CVFold(0, ["P_T4"], ["A01"], ["P_T1"], ["A01"]),
+        }
+        result = (pl.Series([0.1, 0.9, 0.2, 0.8]).to_numpy(), frame["Label"].to_numpy(), {"f": 1.0})
+        clients = "GPU-fixture, 123"
+
+        def query(args, **kwargs):
+            return clients if "--query-compute-apps=gpu_uuid,pid" in args else "GPU-fixture, H100, driver, 95830 MiB"
+
+        def assert_held():
+            with self.assertRaises(BlockingIOError):
+                with allocated_gpu("cuda:0"):
+                    pass
+
+        def fit(*args, **kwargs):
+            self.assertEqual(kwargs["device"], "cuda:0")
+            assert_held()
+            return result
+
+        real_close = executor.ClassificationWriter.close
+
+        def close(writer):
+            assert_held()
+            real_close(writer)
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory, "CUDA_VISIBLE_DEVICES": "GPU-fixture"}),
+            patch("prot_loc_benchmark.classification.train.subprocess.check_output", side_effect=query) as smi,
+            patch.object(executor, "train_and_predict", return_value=result) as train,
+        ):
+            root = Path(directory)
+            with self.assertRaisesRegex(RuntimeError, "compute clients"):
+                executor.run_classifier_tasks([task], "cuda:0", root / "busy")
+            train.assert_not_called()
+            self.assertFalse((root / "busy").exists())
+            clients = ""
+            with allocated_gpu("cuda:0"), self.assertRaises(BlockingIOError):
+                executor.run_classifier_tasks([task], "cuda:0", root / "leased")
+            train.assert_not_called()
+            self.assertFalse((root / "leased").exists())
+            train.side_effect = fit
+            with patch.object(executor.ClassificationWriter, "close", close):
+                metrics, _, _, count = executor.run_classifier_tasks([task], "cuda:0", root / "success")
+                self.assertEqual(count, 1)
+                self.assertEqual(metrics[0]["auroc"], 1.0)
+                self.assertEqual(pl.read_parquet(root / "success/predictions.parquet").height, 4)
+                with allocated_gpu("cuda:0"):  # Released after normal completion.
+                    pass
+                train.side_effect = RuntimeError("fit failed")
+                with self.assertRaisesRegex(RuntimeError, "fit failed"):
+                    executor.run_classifier_tasks([task], "cuda:0", root / "failed")
+                with allocated_gpu("cuda:0"):  # Released after worker failure too.
+                    pass
+            train.side_effect = train_and_predict  # Real CPU fit, still no GPU queries.
+            smi.reset_mock()
+            self.assertEqual(executor.run_classifier_tasks([task], "cpu", root / "cpu")[3], 1)
+            smi.assert_not_called()
 
     def test_gpu_admission_is_exclusive_and_rejects_existing_clients(self):
         with (

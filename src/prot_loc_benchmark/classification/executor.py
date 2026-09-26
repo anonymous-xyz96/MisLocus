@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .io import ClassificationWriter
 from .metrics import compute_classifier_metrics
-from .train import train_and_predict
+from .train import allocated_gpu, train_and_predict
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ def run_classifier_tasks(
 
     t_class = time.time()
     predictions_path = output_dir / "predictions.parquet"
-    with ClassificationWriter(predictions_path) as writer:
+    with allocated_gpu(device), ClassificationWriter(predictions_path) as writer:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_run_classifier, t, t["device"]): t for t in tasks}
             for future in as_completed(futures):
