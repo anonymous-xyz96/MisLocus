@@ -282,6 +282,16 @@ class AlleleRegression(unittest.TestCase):
         self.assertIsInstance(logged['val/macro_ap'], torch.Tensor)
         self.assertEqual(logged['val/macro_ap'].dtype, torch.float64)
 
+    def test_every_shipped_config_is_v2(self):
+        for path in Path('configs').glob('subcell_finetune*.yaml'):
+            config = yaml.safe_load(path.read_text())
+            validate_config(config)
+            if '_s' in path.stem:
+                self.assertTrue(path.stem.endswith(f'_s{config["seed"]}'))
+            config['mask_prob'] = .5
+            with self.assertRaises(ValueError):
+                validate_config(config)
+
 
 if __name__ == '__main__':
     unittest.main()
