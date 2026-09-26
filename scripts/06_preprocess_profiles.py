@@ -76,6 +76,11 @@ import logging
 import sys
 import time
 
+from prot_loc_benchmark.stages import bound_environment
+
+bound_environment()
+# ruff: noqa: E402 -- native thread bounds must precede numerical-library imports.
+
 import polars as pl
 
 from prot_loc_benchmark.config import (
@@ -90,6 +95,8 @@ from prot_loc_benchmark.config import (
     PREPROCESS_VARIANT_ACV_THRESHOLD,
     REP_RAW_FILES,
 )
+from prot_loc_benchmark.downstream_inputs import export_inputs, verify_export
+from prot_loc_benchmark.identity import identify_cells, metadata, save_cell_filter, save_feature_identity
 from prot_loc_benchmark.preprocessing import (
     annotate_controls,
     apply_blocklists,
@@ -105,7 +112,7 @@ from prot_loc_benchmark.preprocessing import (
     select_variant_features,
 )
 from prot_loc_benchmark.preprocessing.normalize import EMBEDDING_STD_EPSILON
-
+from prot_loc_benchmark.stages import require_bounded_execution, stage
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -143,15 +150,26 @@ def preprocess_batch(batch_id: str, normalized_only: bool = False) -> None:
 
     # ── Step 1: Filter to manifest (cell QC gate) ──────────────────────
     logger.info("Step 1/10: Filter to manifest...")
-    lf = filter_to_manifest(str(profiles_path), str(manifest_path))
+    meta_cols = [c for c in pl.read_parquet_schema(profiles_path) if c.startswith("Metadata_")]
+    raw_identity = identify_cells(pl.read_parquet(profiles_path, columns=meta_cols), batch_id)
+    lf = identify_cells(filter_to_manifest(str(profiles_path), str(manifest_path)).collect(), batch_id).lazy()
+    identity = save_cell_filter(
+        raw_identity, lf.select(pl.col("^Metadata_.*$")).collect(), features_path.parent, "manifest"
+    )
 
     # ── Step 2: Drop low-cell-count wells ──────────────────────────────
     logger.info("Step 2/10: Drop low-cell-count wells (<%d)...", PREPROCESS_CC_THRESHOLD)
     lf = drop_low_cell_count_wells(lf, cc_threshold=PREPROCESS_CC_THRESHOLD)
+    identity = save_cell_filter(
+        identity, lf.select(pl.col("^Metadata_.*$")).collect(), features_path.parent, "well_count"
+    )
 
     # ── Step 3: Remove NaN features/rows ───────────────────────────────
     logger.info("Step 3/10: Remove NaN features/rows...")
     lf = drop_nan_features(lf, cell_threshold=PREPROCESS_NAN_THRESHOLD)
+    identity = save_cell_filter(
+        identity, lf.select(pl.col("^Metadata_.*$")).collect(), features_path.parent, "nonfinite"
+    )
 
     # ── Step 4: Compute plate statistics ───────────────────────────────
     logger.info("Step 4/10: Computing plate statistics...")
@@ -161,9 +179,7 @@ def preprocess_batch(batch_id: str, normalized_only: bool = False) -> None:
 
     # ── Step 5: Select variant features ────────────────────────────────
     logger.info("Step 5/10: Selecting variant features...")
-    lf = select_variant_features(
-        lf, plate_stats, acv_threshold=PREPROCESS_VARIANT_ACV_THRESHOLD
-    )
+    lf = select_variant_features(lf, plate_stats, acv_threshold=PREPROCESS_VARIANT_ACV_THRESHOLD)
 
     # ── Step 6: RobustMAD normalization ────────────────────────────────
     logger.info("Step 6/10: RobustMAD normalization...")
@@ -187,6 +203,7 @@ def preprocess_batch(batch_id: str, normalized_only: bool = False) -> None:
     # trips pycytominer's freq_cut heuristic, despite healthy variance).
     #
     logger.info("Step 8b/10: Saving normalized.parquet...")
+    save_feature_identity(identity, pl.from_pandas(df), features_path.parent, "normalized")
     pl.from_pandas(df).write_parquet(str(normalized_path), compression="zstd")
     n_norm_feats = len([c for c in df.columns if not c.startswith("Metadata_")])
     logger.info("Normalized saved: %s (%d features)", normalized_path, n_norm_feats)
@@ -222,6 +239,7 @@ def preprocess_batch(batch_id: str, normalized_only: bool = False) -> None:
 
     # ── Save output ────────────────────────────────────────────────────
     result = lf.collect()
+    save_feature_identity(identity, result, features_path.parent, "features")
     result.write_parquet(str(features_path), compression="zstd")
 
     feat_cols = [c for c in result.columns if not c.startswith("Metadata_")]
@@ -281,27 +299,22 @@ def preprocess_embedding_batch(
     logger.info("=" * 70)
 
     # ── Load + alias Metadata_well_position → Metadata_Well if needed ────
-    # TODO: de-dupe with scripts/09c_classify_PA.py:_resolve_well_col by moving
-    # an alias helper into prot_loc_benchmark.config or a shared util.
-    lf = pl.scan_parquet(str(input_path))
-    cols = lf.collect_schema().names()
-    if "Metadata_Well" not in cols:
-        if "Metadata_well_position" not in cols:
-            logger.error(
-                "Input has neither Metadata_Well nor Metadata_well_position; "
-                "cannot apply well-level filters."
-            )
-            sys.exit(1)
-        logger.info("Aliasing Metadata_well_position → Metadata_Well")
-        lf = lf.with_columns(pl.col("Metadata_well_position").alias("Metadata_Well"))
+    raw = identify_cells(
+        pl.read_parquet(input_path), batch_id, canonical=representation.startswith("subcell_allele_rybg_v2_")
+    )
+    identity = metadata(raw)
+    lf = raw.lazy()
+    del raw  # The lazy plan owns the frame; release raw features when normalization replaces it.
 
     # ── Step 1: Drop low-cell-count wells ───────────────────────────────
     logger.info("Step 1/9: Drop low-cell-count wells (<%d)...", PREPROCESS_CC_THRESHOLD)
     lf = drop_low_cell_count_wells(lf, cc_threshold=PREPROCESS_CC_THRESHOLD)
+    identity = save_cell_filter(identity, lf.select(pl.col("^Metadata_.*$")).collect(), rep_dir, "well_count")
 
     # ── Step 2: Remove NaN features/rows (usually a no-op) ───────────────
     logger.info("Step 2/9: Remove NaN features/rows...")
     lf = drop_nan_features(lf, cell_threshold=PREPROCESS_NAN_THRESHOLD)
+    identity = save_cell_filter(identity, lf.select(pl.col("^Metadata_.*$")).collect(), rep_dir, "nonfinite")
 
     # ── Step 3: Compute plate statistics ────────────────────────────────
     logger.info("Step 3/9: Computing plate statistics...")
@@ -326,6 +339,7 @@ def preprocess_embedding_batch(
     # ── Step 7: Save normalized.parquet ─────────────────────────────────
     logger.info("Step 7/9: Saving normalized.parquet...")
     normalized_df = lf.collect()
+    save_feature_identity(identity, normalized_df, rep_dir, "normalized")
     normalized_df.write_parquet(str(normalized_path), compression="zstd")
     n_norm_feats = len([c for c in normalized_df.columns if not c.startswith("Metadata_")])
     logger.info("Normalized saved: %s (%d features)", normalized_path, n_norm_feats)
@@ -353,6 +367,7 @@ def preprocess_embedding_batch(
     ).collect()
 
     # ── Save features.parquet ───────────────────────────────────────────
+    save_feature_identity(identity, result, rep_dir, "features")
     result.write_parquet(str(features_path), compression="zstd")
 
     feat_cols = [c for c in result.columns if not c.startswith("Metadata_")]
@@ -396,21 +411,40 @@ def main():
             "skips variance threshold."
         ),
     )
+    parser.add_argument("--extraction-spec", help="Required producer run-spec.json for new SubCell exports")
     args = parser.parse_args()
-
+    require_bounded_execution(args.representation)
+    output_dir = (
+        CELLPROFILER_DIR / args.batch
+        if args.representation == "cellprofiler"
+        else INTERIM_DIR / args.representation / args.batch
+    )
+    raw_name = "profiles.parquet" if args.representation == "cellprofiler" else REP_RAW_FILES[args.representation]
+    raw_path = output_dir / raw_name
+    inputs = [raw_path]
     if args.representation == "cellprofiler":
-        preprocess_batch(args.batch, normalized_only=args.normalized_only)
-        output_dir = CELLPROFILER_DIR / args.batch
-    else:
-        preprocess_embedding_batch(
-            args.batch,
-            representation=args.representation,
-            normalized_only=args.normalized_only,
-        )
-        output_dir = INTERIM_DIR / args.representation / args.batch
-
-    from prot_loc_benchmark.provenance import record
-    record(output_dirs=[output_dir])
+        inputs.append(CROP_MANIFEST_DIR / args.batch / "manifest.parquet")
+    elif args.representation.startswith("subcell_allele_rybg_v2_"):
+        inputs += export_inputs(args.extraction_spec, args.representation, output_dir=output_dir)
+    settings = {
+        **vars(args),
+        "well_min_cells": PREPROCESS_CC_THRESHOLD,
+        "nan_feature_threshold": PREPROCESS_NAN_THRESHOLD,
+        "clip": PREPROCESS_OUTLIER_THRESHOLD,
+        "zero_mad": "raw_pass_through",
+        "fit_population": "each_physical_plate_all_retained_cells",
+        "embedding_std_epsilon": EMBEDDING_STD_EPSILON,
+        "cp_acv_threshold": PREPROCESS_VARIANT_ACV_THRESHOLD,
+        "correlation_threshold": 0.9,
+        "correlation_method": "pearson",
+    }
+    with stage(output_dir, inputs, settings, allowed=(raw_name,)):
+        if args.representation.startswith("subcell_allele_rybg_v2_"):
+            verify_export(args.extraction_spec, args.representation, args.batch, raw_path)
+        if args.representation == "cellprofiler":
+            preprocess_batch(args.batch, normalized_only=args.normalized_only)
+        else:
+            preprocess_embedding_batch(args.batch, args.representation, normalized_only=args.normalized_only)
 
 
 if __name__ == "__main__":
