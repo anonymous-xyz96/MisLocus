@@ -20,6 +20,7 @@ from prot_loc_benchmark.representations.subcell_allele_data import (
 )
 from prot_loc_benchmark.representations.subcell_manifest import align_crop_rows, sha256, split_for_plate
 from prot_loc_benchmark.representations.subcell_protocol import model_config, validate_config
+from prot_loc_benchmark.representations.subcell_training import allele_metrics, load_pretrained_weights, lr_factor, optimizer_groups, setup_transforms
 
 
 def make_cohort(root, count=17):
@@ -143,6 +144,92 @@ class AlleleRegression(unittest.TestCase):
         draw = stratified_draw(group, 8, np.random.default_rng(8))
         self.assertEqual(len(set(draw)), 8)
         self.assertEqual(train.loc[draw].groupby('Metadata_Plate').size().tolist(), [4, 4])
+
+    def test_seed_changes_augmentation_masking_dropout_and_sampling(self):
+        embeddings = tiny_components('mae')['encoder'].embeddings
+        images = torch.linspace(0, 1, 2 * 4 * 32 * 32).reshape(2, 4, 32, 32)
+
+        def draw(seed):
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            geometry, intensity = setup_transforms()
+            first, second = geometry(images.clone()), geometry(images.clone())
+            second = intensity(second)
+            mask = embeddings.random_masking(torch.zeros(2, 784, 16), mask_ratio=.25)[1]
+            dropout = torch.nn.functional.dropout(torch.ones(512), p=.5, training=True)
+            weight = torch.nn.Linear(16, 8).weight.detach().clone()
+            return first, second, mask, dropout, weight
+
+        baseline = draw(42)
+        self.assertFalse(torch.equal(baseline[0], baseline[1]))
+        self.assertTrue(all(torch.equal(a, b) for a, b in zip(baseline, draw(42))))
+        train = self.frame.loc[self.frame.split == 'train']
+        for seed in (43, 44):
+            # Same-seed replay models shared rank streams; changing the run seed is different.
+            self.assertTrue(all(not torch.equal(a, b) for a, b in zip(baseline, draw(seed))))
+            self.assertNotEqual(list(AlleleBatchSampler(train, 42)), list(AlleleBatchSampler(train, seed)))
+
+    def test_preprocessing_geometry_and_joint_normalization(self):
+        preprocess = SubCellPreprocessor()
+        self.assertEqual((preprocess.rescaled_size, preprocess.crop_offset), (955, 253))
+        image = torch.arange(4 * 128 * 128, dtype=torch.float32).reshape(1, 4, 128, 128)
+        expected = torch.nn.functional.interpolate(image, size=955, mode='bilinear', align_corners=False)[:, :, 253:701, 253:701]
+        expected = (expected - expected.min()) / (expected.max() - expected.min() + 1e-6)
+        self.assertTrue(torch.equal(preprocess(image), expected))
+        self.assertEqual(preprocess(torch.ones_like(image)).count_nonzero().item(), 0)
+        with self.assertRaisesRegex(ValueError, 'finite'):
+            preprocess(torch.full_like(image, float('nan')))
+
+    def test_native_scheduler_before_update_and_resume(self):
+        parameter = torch.nn.Parameter(torch.ones(()))
+        opt = torch.optim.AdamW([parameter], lr=5e-5)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lambda u: lr_factor(u, 200, 10))
+        rates = []
+        for i in range(200):
+            rates.append(opt.param_groups[0]['lr'])
+            if i == 7:
+                saved = (copy.deepcopy(opt.state_dict()), copy.deepcopy(scheduler.state_dict()))
+            parameter.grad = torch.ones_like(parameter)
+            opt.step()
+            scheduler.step()
+        self.assertEqual(rates[0], 0)
+        self.assertAlmostEqual(rates[1], 5e-6)
+        self.assertEqual(rates[10], 5e-5)
+        self.assertGreater(rates[-1], 5e-8)
+        self.assertAlmostEqual(opt.param_groups[0]['lr'], 5e-8)
+        opt.load_state_dict(saved[0])
+        scheduler.load_state_dict(saved[1])
+        for rate in rates[7:]:
+            self.assertEqual(opt.param_groups[0]['lr'], rate)
+            opt.step()
+            scheduler.step()
+
+
+    def test_validation_deduplicates_and_omits_unsupported(self):
+        probs = np.array([[.8, .15, .05], [.1, .8, .1], [.4, .5, .1]])
+        labels = np.array([0, 1, 0])
+        losses = np.array([1., 2., 3.])
+        expected = allele_metrics([10, 11, 12], labels, probs, losses, [10, 11, 12])
+        actual = allele_metrics([10, 11, 12, 10], labels[[0, 1, 2, 0]], probs[[0, 1, 2, 0]],
+                               losses[[0, 1, 2, 0]], [10, 11, 12])
+        self.assertEqual(expected, actual)
+        self.assertEqual(actual['omitted'], [2])
+        self.assertEqual(actual['macro_ap'], 1.)
+        self.assertAlmostEqual(actual['top1'], 2 / 3)
+        self.assertEqual(actual['probe_loss'], 2.)
+        with self.assertRaisesRegex(ValueError, 'coverage'):
+            allele_metrics([10, 11, 12], labels, probs, losses, [10, 11])
+
+    def test_eval_zero_mask_is_identity_and_does_not_consume_rng(self):
+        encoder = tiny_components('mae')['encoder'].eval()
+        tokens = torch.randn(2, 784, 16)
+        state = torch.get_rng_state().clone()
+        actual, mask, restore = encoder.embeddings.random_masking(tokens, mask_ratio=0.)
+        self.assertTrue(torch.equal(actual, tokens))
+        self.assertTrue(torch.equal(state, torch.get_rng_state()))
+        self.assertEqual(mask.count_nonzero().item(), 0)
+        self.assertTrue(torch.equal(restore, torch.arange(784).expand(2, -1)))
 
 
 if __name__ == '__main__':
